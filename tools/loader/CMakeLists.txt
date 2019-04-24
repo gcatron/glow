@@ -7,6 +7,7 @@ target_link_libraries(image-classifier
                         Base
                         Converter
                         ExecutionEngine
+                        HostManager
                         Graph
                         Importer
                         Optimizer
@@ -22,6 +23,7 @@ target_link_libraries(text-translator
                         Base
                         Converter
                         Graph
+                        HostManager
                         Importer
                         ExecutionEngine
                         Optimizer
@@ -37,6 +39,7 @@ target_link_libraries(model-runner
                         Base
                         Converter
                         Graph
+                        HostManager
                         Importer
                         ExecutionEngine
                         Optimizer

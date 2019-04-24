@@ -17,6 +17,7 @@
 #define GLOW_TOOLS_LOADER_LOADER_H
 
 #include "glow/ExecutionEngine/ExecutionEngine.h"
+#include "glow/Runtime/HostManager/HostManager.h"
 
 namespace glow {
 
@@ -37,10 +38,14 @@ class Loader {
   std::string caffe2NetWeightFilename_;
   /// ONNX model file name.
   std::string onnxModelFilename_;
-  /// Execution engine for compiling and running.
-  ExecutionEngine EE_{};
+  /// Host Manager for running the model.
+  std::unique_ptr<glow::runtime::HostManager> hostManager_;
+  /// Backend used for saving bundle and quantization.
+  glow::Backend *backend_;
   /// Function containing the model.
   Function *F_{nullptr};
+  /// Module
+  std::unique_ptr<Module> M_;
   /// A map between quantization profiling names of NodeValues that were lowered
   /// from each other. Maps to a set of names of NodeValues and their NodeKinds
   /// that were replaced by the NodeValue (whose output name is the key) that

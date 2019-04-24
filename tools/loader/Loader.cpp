@@ -18,10 +18,10 @@
 
 #include "glow/Base/Tensor.h"
 #include "glow/Converter/TypeAToTypeBFunctionConverter.h"
-#include "glow/ExecutionEngine/ExecutionEngine.h"
 #include "glow/IR/IR.h"
 #include "glow/Quantization/Quantization.h"
 #include "glow/Quantization/Serialization.h"
+#include "glow/Runtime/RuntimeTypes.h"
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -30,6 +30,8 @@
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <future>
 
 using namespace glow;
 
@@ -316,7 +318,7 @@ void Loader::compile(PlaceholderBindings &bindings) {
     // lowered, however all lowered and unlowered components have a profile, and
     // so the backend can lower however it prefers and always find all of its
     // NodeValue's quantization parameters.
-    ::lower(F_, &loweredMap_, EE_.getBackend());
+    ::lower(F_, &loweredMap_, backend_);
 
     quantization::QuantizationConfiguration quantConfig{
         deserializeFromYaml(loadProfileFileOpt)};
@@ -327,8 +329,8 @@ void Loader::compile(PlaceholderBindings &bindings) {
     quantConfig.enableRowwise = enableRowwiseOpt;
     quantConfig.assertAllNodesQuantized = assertAllNodesQuantizedOpt;
 
-    quantization::quantizeFunction(F_, quantConfig, *EE_.getBackend(),
-                                   loweredMap_, keepOriginalPrecisionForNodes);
+    quantization::quantizeFunction(F_, quantConfig, *backend_, loweredMap_,
+                                   keepOriginalPrecisionForNodes);
   }
 
   if (convertToFP16) {
@@ -343,10 +345,12 @@ void Loader::compile(PlaceholderBindings &bindings) {
   cctx.mode = CompilationMode::Infer;
   if (emittingBundle()) {
     // Emit IR for the graph, compile it and save as a bundle.
-    EE_.save(F_, cctx, emitBundle, networkName);
+    ::glow::optimizeFunction(F_, *backend_, cctx);
+    backend_->save(F_, emitBundle, networkName);
   } else {
     // Emit IR for the graph and compile it.
-    EE_.compile(F_, cctx);
+    auto error = hostManager_->addNetwork(std::move(M_));
+    EXIT_ON_ERR(std::move(error));
   }
 
   if (dumpGraphOpt) {
@@ -366,7 +370,26 @@ void Loader::runInference(PlaceholderBindings &bindings, size_t batchSize) {
     timer.startTimer();
   }
   for (unsigned i = 0; i < iterationsOpt; i++) {
-    EE_.run(bindings);
+    std::unique_ptr<PlaceholderBindings> phBindings(&bindings);
+    std::unique_ptr<ExecutionContext> context =
+        llvm::make_unique<ExecutionContext>(std::move(phBindings));
+    std::promise<void> runPromise;
+    auto fut = runPromise.get_future();
+    llvm::Error runErr = llvm::Error::success();
+    hostManager_->runNetwork(
+        modelPathOpt[0], std::move(context),
+        [&runPromise, &runErr](runtime::RunIdentifierTy, llvm::Error err,
+                               std::unique_ptr<ExecutionContext> contextPtr) {
+          // Don't delete ph bindings.
+          std::unique_ptr<PlaceholderBindings> phBind =
+              contextPtr->movePlaceholderBindings();
+          phBind.release();
+          runErr = std::move(err);
+          runPromise.set_value();
+        });
+
+    fut.wait();
+    EXIT_ON_ERR(std::move(runErr));
   }
   if (timeOpt) {
     timer.stopTimer();
@@ -414,7 +437,19 @@ Loader::Loader(int argc, char **argv) {
     caffe2NetDescFilename_ = modelPathOpt[0];
     caffe2NetWeightFilename_ = modelPathOpt[1];
   }
+  M_.reset(new Module);
+  std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
+  if (ExecutionBackend == BackendKind::OpenCL) {
 
-  EE_.setBackend(ExecutionBackend);
-  F_ = EE_.getModule().createFunction(modelPathOpt[0]);
+    auto clConfig = new runtime::OpenCLDeviceConfig();
+    std::unique_ptr<runtime::DeviceConfig> config(clConfig);
+    configs.push_back(std::move(config));
+  } else {
+    auto config = llvm::make_unique<runtime::DeviceConfig>(ExecutionBackend);
+    configs.push_back(std::move(config));
+  }
+
+  hostManager_ = llvm::make_unique<runtime::HostManager>(std::move(configs));
+  backend_ = createBackend(ExecutionBackend);
+  F_ = M_->createFunction(modelPathOpt[0]);
 }
