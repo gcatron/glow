@@ -138,6 +138,16 @@ public:
   void setName(llvm::StringRef name) { name_ = name; }
 };
 
+/// OpenCL Device Manager config object. This contains the information needed to
+/// target a specifc OpenCL device. This inherits from DeviceConfig and sets
+/// it's inherited member backendKind_ to OpenCL.
+struct OpenCLDeviceConfig : DeviceConfig {
+  OpenCLDeviceConfig() : DeviceConfig(BackendKind::OpenCL) {}
+  unsigned platformId{0};
+  unsigned deviceId{0};
+  bool doProfile{false};
+};
+
 } // namespace runtime
 } // namespace glow
 #endif // GLOW_RUNTIME_RUNTIMETYPES_H
