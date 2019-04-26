@@ -439,6 +439,13 @@ Loader::Loader(int argc, char **argv) {
   }
   M_.reset(new Module);
   std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
+  // This is currently a CPU config, you will want to change this to the primary
+  // backendKind that you are developing.
+  auto primaryDev = llvm::make_unique<runtime::DeviceConfig>(BackendKind::CPU);
+  configs.push_back(std::move(primaryDev));
+
+  // This is the second device, it defaults to interpreter but you can set it to
+  // cpu with -cpu.
   if (ExecutionBackend == BackendKind::OpenCL) {
 
     auto clConfig = new runtime::OpenCLDeviceConfig();
