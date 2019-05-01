@@ -65,11 +65,12 @@ llvm::cl::opt<bool>
             llvm::cl::desc("Specify whether to run with verbose output"),
             llvm::cl::Optional, llvm::cl::cat(loaderCat));
 
-llvm::cl::opt<bool>
-    timeOpt("time",
-            llvm::cl::desc("Print timer output to stderr detailing how long it "
-                           "takes for the program to execute"),
-            llvm::cl::Optional, llvm::cl::cat(loaderCat));
+// llvm::cl::opt<bool>
+//     timeOpt("time",
+//             llvm::cl::desc("Print timer output to stderr detailing how long
+//             it "
+//                            "takes for the program to execute"),
+//             llvm::cl::Optional, llvm::cl::cat(loaderCat));
 
 llvm::cl::opt<unsigned> iterationsOpt(
     "iterations", llvm::cl::desc("Number of iterations to perform"),
@@ -142,6 +143,11 @@ llvm::cl::opt<BackendKind> ExecutionBackend(
                      clEnumValN(BackendKind::OpenCL, "opencl", "Use OpenCL"),
                      clEnumValN(BackendKind::Habana, "habana", "Use Habana")),
     llvm::cl::init(BackendKind::Interpreter), llvm::cl::cat(loaderCat));
+
+llvm::cl::opt<unsigned> numDevices("num-devices",
+                                   llvm::cl::desc("Number of Devices to use"),
+                                   llvm::cl::init(1), llvm::cl::value_desc("N"),
+                                   llvm::cl::cat(loaderCat));
 
 /// Debugging options.
 llvm::cl::OptionCategory
@@ -349,7 +355,7 @@ void Loader::compile(PlaceholderBindings &bindings) {
     backend_->save(F_, emitBundle, networkName);
   } else {
     // Emit IR for the graph and compile it.
-    auto error = hostManager_->addNetwork(std::move(M_));
+    auto error = hostManager_->addNetwork(std::move(M_), /*saturateHost*/ true);
     EXIT_ON_ERR(std::move(error));
   }
 
@@ -366,9 +372,9 @@ void Loader::runInference(PlaceholderBindings &bindings, size_t batchSize) {
          "No inference is performed in the bundle generation mode.");
 
   llvm::Timer timer("Infer", "Infer");
-  if (timeOpt) {
-    timer.startTimer();
-  }
+  // if (timeOpt) {
+  //   timer.startTimer();
+  // }
   for (unsigned i = 0; i < iterationsOpt; i++) {
     std::unique_ptr<PlaceholderBindings> phBindings(&bindings);
     std::unique_ptr<ExecutionContext> context =
@@ -391,12 +397,12 @@ void Loader::runInference(PlaceholderBindings &bindings, size_t batchSize) {
     fut.wait();
     EXIT_ON_ERR(std::move(runErr));
   }
-  if (timeOpt) {
-    timer.stopTimer();
-    llvm::outs() << llvm::formatv("Wall time per item (s): {0:f4}\n",
-                                  timer.getTotalTime().getWallTime() /
-                                      iterationsOpt / batchSize);
-  }
+  // if (timeOpt) {
+  //   timer.stopTimer();
+  //   llvm::outs() << llvm::formatv("Wall time per item (s): {0:f4}\n",
+  //                                 timer.getTotalTime().getWallTime() /
+  //                                     iterationsOpt / batchSize);
+  // }
 }
 
 void Loader::generateAndSerializeQuantizationInfos(
@@ -440,13 +446,9 @@ Loader::Loader(int argc, char **argv) {
   name_ = modelPathOpt[0];
   M_.reset(new Module);
   std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
-  if (ExecutionBackend == BackendKind::OpenCL) {
-
-    auto clConfig = new runtime::OpenCLDeviceConfig();
-    std::unique_ptr<runtime::DeviceConfig> config(clConfig);
-    configs.push_back(std::move(config));
-  } else {
+  for (int i = 0; i < numDevices; i++) {
     auto config = llvm::make_unique<runtime::DeviceConfig>(ExecutionBackend);
+    config->setName(std::to_string(i));
     configs.push_back(std::move(config));
   }
 

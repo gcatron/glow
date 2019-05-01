@@ -25,8 +25,10 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <atomic>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -103,6 +105,12 @@ llvm::cl::opt<bool> preProcessImages(
     "preprocess-images",
     llvm::cl::desc("Perform Image processing outside of the inference loop."),
     llvm::cl::Optional, llvm::cl::init(false), llvm::cl::cat(imageLoaderCat));
+
+llvm::cl::opt<bool>
+    timeOpt("time",
+            llvm::cl::desc("Print timer output to stderr detailing how long it "
+                           "takes for the program to execute"),
+            llvm::cl::Optional, llvm::cl::cat(imageLoaderCat));
 } // namespace
 
 /// Write a prompt to stdout asking for filenames for classification. Read in
@@ -374,10 +382,11 @@ int main(int argc, char **argv) {
 
   std::unique_ptr<ExecutionContext> context =
       llvm::make_unique<ExecutionContext>();
+  llvm::Timer timer("Infer", "Infer");
 
   PlaceholderBindings *bindings = context->getPlaceholderBindings();
-  // The loader verifies/initializes command line parameters, and initializes
-  // the ExecutionEngine and Function.
+  // The loader verifies/initializes command line parameters, and
+  // initializes the ExecutionEngine and Function.
   Loader loader(argc, argv);
 
   if (inputImageListFile.empty() && inputImageFilenames.size() == 0) {
@@ -492,7 +501,7 @@ int main(int argc, char **argv) {
     updateInputPlaceholders(*bindings, {inputImagePH}, {inputImageData.get()});
 
     // Perform the inference execution, updating SMT.
-    // auto batchSize = inputImageData.dims()[0];
+    auto batchSize = inputImageData->dims()[0];
     // loader.runInference(*bindings, batchSize);
     if (preProcessImages) {
       auto newContext = llvm::make_unique<ExecutionContext>();
@@ -512,20 +521,27 @@ int main(int argc, char **argv) {
       std::promise<void> runPromise;
       auto fut = runPromise.get_future();
       llvm::Error runErr = llvm::Error::success();
+      if (timeOpt) {
+        timer.startTimer();
+      }
       hostManager->runNetwork(
           name, std::move(context),
-          [&runPromise, &runErr](runtime::RunIdentifierTy, llvm::Error err,
-                                 std::unique_ptr<ExecutionContext> contextPtr) {
-            // Don't delete ph bindings.
-            std::unique_ptr<PlaceholderBindings> phBind =
-                contextPtr->movePlaceholderBindings();
-            phBind.release();
+          [&runPromise, &runErr,
+           &context](runtime::RunIdentifierTy, llvm::Error err,
+                     std::unique_ptr<ExecutionContext> contextPtr) {
+            context = std::move(contextPtr);
             runErr = std::move(err);
             runPromise.set_value();
           });
 
       fut.wait();
       EXIT_ON_ERR(std::move(runErr));
+      if (timeOpt) {
+        timer.stopTimer();
+        llvm::outs() << llvm::formatv("Wall time per item (s): {0:f4}\n",
+                                      timer.getTotalTime().getWallTime() /
+                                          batchSize);
+      }
 
       // Print the top-k results from the output Softmax tensor.
       numErrors += processAndPrintResults(SMT, inputImageBatchFilenames);
@@ -535,22 +551,39 @@ int main(int argc, char **argv) {
   if (preProcessImages) {
     runtime::HostManager *hostManager = loader.getHostManager();
     std::string name = loader.getModelName();
-
+    std::atomic<unsigned> inFlight(0);
+    std::promise<void> runPromise;
+    auto fut = runPromise.get_future();
+    if (timeOpt) {
+      timer.startTimer();
+    }
     for (auto &batch : contexts) {
       auto output = batch.second->getPlaceholderBindings()->get(outputPH);
       auto names = batch.first;
       llvm::Error runErr = llvm::Error::success();
+      inFlight++;
       hostManager->runNetwork(
           name, std::move(batch.second),
-          [&runErr, &output,
-           names](runtime::RunIdentifierTy, llvm::Error err,
-                  std::unique_ptr<ExecutionContext> contextPtr) {
+          [&runErr, output, names, &runPromise,
+           &inFlight](runtime::RunIdentifierTy, llvm::Error err,
+                      std::unique_ptr<ExecutionContext> contextPtr) {
             runErr = std::move(err);
             // Print the top-k results from the output Softmax tensor.
             processAndPrintResults(output, names);
+            if (--inFlight == 0) {
+              runPromise.set_value();
+            }
           });
 
       EXIT_ON_ERR(std::move(runErr));
+    }
+    // wait for all to finish.
+    fut.wait();
+    if (timeOpt) {
+      timer.stopTimer();
+      llvm::outs() << llvm::formatv("Wall time per item (s): {0:f4}\n",
+                                    timer.getTotalTime().getWallTime() /
+                                        inputImageFilenames.size());
     }
   }
 
