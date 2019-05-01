@@ -28,6 +28,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <queue>
@@ -97,6 +98,11 @@ llvm::cl::list<unsigned> expectedMatchingLabels(
     llvm::cl::desc("The comma delimited list of the matching lables"),
     llvm::cl::value_desc("int"), llvm::cl::ZeroOrMore, llvm::cl::CommaSeparated,
     llvm::cl::cat(imageLoaderCat));
+
+llvm::cl::opt<bool> preProcessImages(
+    "preprocess-images",
+    llvm::cl::desc("Perform Image processing outside of the inference loop."),
+    llvm::cl::Optional, llvm::cl::init(false), llvm::cl::cat(imageLoaderCat));
 } // namespace
 
 /// Write a prompt to stdout asking for filenames for classification. Read in
@@ -168,7 +174,7 @@ createProtobufLoader(Loader &loader, TypeRef inputImageType) {
 /// from the provided protobuf file found via \p loader. Then compiles and
 /// \returns a pair of pointers to the input Placeholder and output Tensor for
 /// the Softmax.
-static std::pair<Placeholder *, Tensor *>
+static std::pair<Placeholder *, Placeholder *>
 buildAndCompileAndGetInAndOutPair(Loader &loader, PlaceholderBindings &bindings,
                                   TypeRef inputImageType) {
   auto LD = createProtobufLoader(loader, inputImageType);
@@ -198,9 +204,9 @@ buildAndCompileAndGetInAndOutPair(Loader &loader, PlaceholderBindings &bindings,
   // Get the Tensor from the Placeholder that the final expected Softmax writes
   // into at the end of image inference.
   Placeholder *SMPH = EXIT_ON_ERR(LD->getSingleOutput());
-  Tensor *SMT = bindings.get(SMPH);
+  // Tensor *SMT = bindings.get(SMPH);
 
-  return std::make_pair(inputImagePH, SMT);
+  return std::make_pair(inputImagePH, SMPH);
 }
 
 /// A pair representing a float and the index where the float was found.
@@ -365,7 +371,11 @@ static void parseInputImageList(const std::string &inputImageListFile) {
 }
 
 int main(int argc, char **argv) {
-  PlaceholderBindings bindings;
+
+  std::unique_ptr<ExecutionContext> context =
+      llvm::make_unique<ExecutionContext>();
+
+  PlaceholderBindings *bindings = context->getPlaceholderBindings();
   // The loader verifies/initializes command line parameters, and initializes
   // the ExecutionEngine and Function.
   Loader loader(argc, argv);
@@ -417,6 +427,7 @@ int main(int argc, char **argv) {
 
   // These will be set during the first run.
   Placeholder *inputImagePH = nullptr;
+  Placeholder *outputPH = nullptr;
   Tensor *SMT = nullptr;
 
   size_t minibatchIndex = 0;
@@ -430,14 +441,20 @@ int main(int argc, char **argv) {
   llvm::outs() << "Model: " << loader.getFunction()->getName() << "\n";
 
   int numErrors = 0;
+  // Image tensors loaded up to be run at once for benchmark mode.
+  std::vector<std::unique_ptr<Tensor>> preLoadedImages;
+  std::map<std::vector<std::string>, std::unique_ptr<ExecutionContext>>
+      contexts;
+
   while ((streamInputFilenamesMode &&
           getNextImageFilenames(&inputImageBatchFilenames)) ||
          (miniBatchMode &&
           getNextMiniBatch(inputImageBatchFilenames, inputImageFilenames,
                            minibatchIndex, miniBatch)) ||
          isFirstRun) {
+    auto inputImageData = llvm::make_unique<Tensor>();
     // Load and process the image data into the inputImageData Tensor.
-    loadImagesAndPreprocess(inputImageBatchFilenames, &inputImageData,
+    loadImagesAndPreprocess(inputImageBatchFilenames, inputImageData.get(),
                             imageNormMode, imageChannelOrder, imageLayout);
 
     // If this is the first run, then we need to build and compile the model.
@@ -446,9 +463,9 @@ int main(int argc, char **argv) {
 
       // Build and compile the graph, and then get back the input Placeholder
       // and output Softmax Tensor.
-      std::pair<Placeholder *, Tensor *> inputOutputPair =
-          buildAndCompileAndGetInAndOutPair(loader, bindings,
-                                            &inputImageData.getType());
+      std::pair<Placeholder *, Placeholder *> inputOutputPair =
+          buildAndCompileAndGetInAndOutPair(loader, *bindings,
+                                            &inputImageData->getType());
 
       // If in bundle mode, the bundle has been saved by the above call, so we
       // can safely return.
@@ -457,34 +474,91 @@ int main(int argc, char **argv) {
       }
 
       inputImagePH = inputOutputPair.first;
-      SMT = inputOutputPair.second;
+      SMT = bindings->get(inputOutputPair.second);
+      outputPH = inputOutputPair.second;
     }
     assert(inputImagePH && SMT && "Input and output must be valid.");
-    GLOW_ASSERT(inputImagePH->dims() == inputImageData.dims() &&
+    GLOW_ASSERT(inputImagePH->dims() == inputImageData->dims() &&
                 "New input shape does not match the compiled function.");
 
     // Convert the raw input to fp16. This must be done every time we get new
     // image data.
     if (convertInAndOutToFp16) {
-      inputImageData.convertToType(ElemKind::Float16Ty);
+      inputImageData->convertToType(ElemKind::Float16Ty);
     }
 
     // About to run inference, so update the input image Placeholder's backing
     // Tensor with inputImageData.
-    updateInputPlaceholders(bindings, {inputImagePH}, {&inputImageData});
+    updateInputPlaceholders(*bindings, {inputImagePH}, {inputImageData.get()});
 
     // Perform the inference execution, updating SMT.
-    auto batchSize = inputImageData.dims()[0];
-    loader.runInference(bindings, batchSize);
+    // auto batchSize = inputImageData.dims()[0];
+    // loader.runInference(*bindings, batchSize);
+    if (preProcessImages) {
+      auto newContext = llvm::make_unique<ExecutionContext>();
+      auto ph = newContext->getPlaceholderBindings();
+      ph->allocate(inputImagePH);
+      ph->allocate(outputPH);
+      updateInputPlaceholders(*ph, {inputImagePH}, {inputImageData.get()});
 
-    // Print the top-k results from the output Softmax tensor.
-    numErrors += processAndPrintResults(SMT, inputImageBatchFilenames);
+      preLoadedImages.push_back(std::move(inputImageData));
+      contexts.emplace(inputImageBatchFilenames, std::move(newContext));
+
+    } else {
+
+      runtime::HostManager *hostManager = loader.getHostManager();
+      std::string name = loader.getModelName();
+
+      std::promise<void> runPromise;
+      auto fut = runPromise.get_future();
+      llvm::Error runErr = llvm::Error::success();
+      hostManager->runNetwork(
+          name, std::move(context),
+          [&runPromise, &runErr](runtime::RunIdentifierTy, llvm::Error err,
+                                 std::unique_ptr<ExecutionContext> contextPtr) {
+            // Don't delete ph bindings.
+            std::unique_ptr<PlaceholderBindings> phBind =
+                contextPtr->movePlaceholderBindings();
+            phBind.release();
+            runErr = std::move(err);
+            runPromise.set_value();
+          });
+
+      fut.wait();
+      EXIT_ON_ERR(std::move(runErr));
+
+      // Print the top-k results from the output Softmax tensor.
+      numErrors += processAndPrintResults(SMT, inputImageBatchFilenames);
+    }
+  }
+  /////// walk map and do all inference at once.
+  if (preProcessImages) {
+    runtime::HostManager *hostManager = loader.getHostManager();
+    std::string name = loader.getModelName();
+
+    for (auto &batch : contexts) {
+      auto output = batch.second->getPlaceholderBindings()->get(outputPH);
+      auto names = batch.first;
+      llvm::Error runErr = llvm::Error::success();
+      hostManager->runNetwork(
+          name, std::move(batch.second),
+          [&runErr, &output,
+           names](runtime::RunIdentifierTy, llvm::Error err,
+                  std::unique_ptr<ExecutionContext> contextPtr) {
+            runErr = std::move(err);
+            // Print the top-k results from the output Softmax tensor.
+            processAndPrintResults(output, names);
+          });
+
+      EXIT_ON_ERR(std::move(runErr));
+    }
   }
 
   // If profiling, generate and serialize the quantization infos now that we
   // have run inference one or more times to gather the profile.
+
   if (profilingGraph()) {
-    loader.generateAndSerializeQuantizationInfos(bindings);
+    loader.generateAndSerializeQuantizationInfos(*bindings);
   }
 
   return numErrors;

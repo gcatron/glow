@@ -52,7 +52,14 @@ class Loader {
   /// replaced them.
   LoweredInfoMap loweredMap_;
 
+  /// Model Name.
+  std::string name_;
+
 public:
+  /// Get hostManager.
+  runtime::HostManager *getHostManager() { return hostManager_.get(); }
+  /// Getter for model name.
+  std::string getModelName() { return name_; }
   /// Getter for the Function.
   Function *getFunction() { return F_; }
   /// Getter for the Module.

@@ -437,6 +437,7 @@ Loader::Loader(int argc, char **argv) {
     caffe2NetDescFilename_ = modelPathOpt[0];
     caffe2NetWeightFilename_ = modelPathOpt[1];
   }
+  name_ = modelPathOpt[0];
   M_.reset(new Module);
   std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
   if (ExecutionBackend == BackendKind::OpenCL) {
