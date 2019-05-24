@@ -128,6 +128,10 @@ struct DeviceConfig {
   /// An enum indicating what kind of backend this config is for. It is used in
   /// checking the type of config before casting to a derived class.
   const BackendKind backendKind;
+
+  /// Size of the device memory in bytes.
+  uint64_t deviceSize{0};
+
   /// A human readable name to identify the device.
   std::string name;
 

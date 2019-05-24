@@ -19,6 +19,7 @@
 #include "glow/ExecutionEngine/ExecutionEngine.h"
 #include "glow/Graph/Graph.h"
 #include "glow/Partitioner/Partitioner.h"
+#include "glow/Runtime/HostManager/HostManager.h"
 
 #include "gtest/gtest.h"
 
@@ -114,6 +115,16 @@ protected:
   // Result handle.
   Placeholder *result{nullptr};
 
+  // HostManager for recsysy.
+  std::unique_ptr<HostManager> hostManager_;
+  // HostManager for partitioned
+  std::unique_ptr<HostManager> hostManagerPartitioned_;
+  // Other Mod for host manager.
+  std::unique_ptr<Module> module_;
+
+  // Raw Module pointer.
+  Module *rawModule_;
+
   void SetUp() override {
     /// Test configuration, tweak here:
     miniBatch = 16;
@@ -125,6 +136,9 @@ protected:
     deviceMemCapacity = 1024 * 1024 * 6; // 6 MB.
 
     numDevices = 6;
+    module_.reset(new Module);
+    F_ = module_->createFunction("main");
+    rawModule_ = module_.get();
   }
 
   void TearDown() override {
@@ -136,32 +150,32 @@ protected:
 
   /// Returns a new Constant, of the provided \p type and \p dims initialized
   /// with random data.
-  static Constant *createRandomizedConstant(Module &mod_, TypeRef type,
+  static Constant *createRandomizedConstant(Module *module_, TypeRef type,
                                             llvm::ArrayRef<size_t> dims,
                                             llvm::StringRef name,
                                             float min = 0.0, float max = 1.0) {
-    auto *c =
-        mod_.createConstant(mod_.uniqueTypeWithNewShape(type, dims), name);
+    auto *c = module_->createConstant(
+        module_->uniqueTypeWithNewShape(type, dims), name);
 
     switch (type->getElementType()) {
     case ElemKind::FloatTy: {
-      c->getHandle<float>().randomize(min, max, mod_.getPRNG());
+      c->getHandle<float>().randomize(min, max, module_->getPRNG());
       break;
     }
     case ElemKind::Float16Ty: {
-      c->getHandle<float16_t>().randomize(min, max, mod_.getPRNG());
+      c->getHandle<float16_t>().randomize(min, max, module_->getPRNG());
       break;
     }
     case ElemKind::Int32QTy: {
-      c->getHandle<int32_t>().randomize(-INT32_MAX, INT32_MAX, mod_.getPRNG());
+      c->getHandle<int32_t>().randomize(-10000, 10000, module_->getPRNG());
       break;
     }
     case ElemKind::Int8QTy: {
-      c->getHandle<int8_t>().randomize(-128, 127, mod_.getPRNG());
+      c->getHandle<int8_t>().randomize(-128, 127, module_->getPRNG());
       break;
     }
     case ElemKind::UInt8FusedQTy: {
-      c->getHandle<uint8_t>().randomize(0, 255, mod_.getPRNG());
+      c->getHandle<uint8_t>().randomize(0, 255, module_->getPRNG());
       break;
     }
     default:
@@ -175,9 +189,9 @@ protected:
   /// quantization scales and offsets (i.e. the last 8 bytes of each row
   /// contains the scale and offset).
   static Constant *createRandomFusedRowwiseQuantizedConstant(
-      Module &mod_, llvm::ArrayRef<size_t> dims, llvm::StringRef name) {
+      Module *module_, llvm::ArrayRef<size_t> dims, llvm::StringRef name) {
     Constant *c = createRandomizedConstant(
-        mod_, mod_.uniqueType(ElemKind::UInt8FusedQTy, {1}, 1, 0),
+        module_, module_->uniqueType(ElemKind::UInt8FusedQTy, {1}, 1, 0),
         {dims[0], dims[1] + 8}, name);
 
     auto *dbP = c->getPayload().getUnsafePtr();
@@ -206,7 +220,7 @@ protected:
   ///   * Parent node \p N_ has output dimension \p input_dim.
   ///   * Hidden layers have dimension of \p int_dim * int_dim.
   ///   * Output layer has output dimension \p output_dim.
-  static Node *createMLP(Module &mod_, PlaceholderBindings &bindings,
+  static Node *createMLP(Module *mod_, PlaceholderBindings &bindings,
                          Function *F_, Node *N_, size_t input_dim,
                          size_t int_dim, size_t output_dim,
                          size_t intermediate_layers) {
@@ -215,7 +229,7 @@ protected:
     // Type object for the internal layers.
     // Note: dimension argument is a placeholder and will get filled out by each
     // createRandomizedConstant invocation.
-    auto internalType = mod_.uniqueType(ElemKind::FloatTy, {1});
+    auto internalType = mod_->uniqueType(ElemKind::FloatTy, {1});
 
     /// Initial
     auto *initial_bias = createRandomizedConstant(mod_, internalType, {int_dim},
@@ -273,7 +287,7 @@ protected:
   ///   * weights to be Float32 and convert to Int8 fused rowwise quantized
   ///     Tensors internally
   ///   * Biases are Int32 quantized.
-  static Node *createQuantizedMLP(Module &mod_, PlaceholderBindings &bindings,
+  static Node *createQuantizedMLP(Module *mod_, PlaceholderBindings &bindings,
                                   Function *F_, Node *N_, size_t input_dim,
                                   size_t int_dim, size_t output_dim,
                                   size_t intermediate_layers) {
@@ -287,14 +301,14 @@ protected:
     // Type objects for the internal types.
     // Note: dimension argument is a placeholder and will get filled out by each
     // createRandomizedConstant invocation.
-    auto internalTypeF = mod_.uniqueType(ElemKind::FloatTy, {1});
-    auto internalTypeQ = mod_.uniqueType(ElemKind::Int8QTy, {1}, 1, 0);
-    auto internalBiasType = mod_.uniqueType(ElemKind::Int32QTy, {1}, 1e-11, 0);
+    auto internalTypeF = mod_->uniqueType(ElemKind::FloatTy, {1});
+    auto internalTypeQ = mod_->uniqueType(ElemKind::Int8QTy, {1}, 1, 0);
+    auto internalBiasType = mod_->uniqueType(ElemKind::Int32QTy, {1}, 1e-11, 0);
 
     Node *start = N_;
     start = F_->createQuantize(
         "mlp_quant", N_,
-        mod_.uniqueTypeWithNewShape(internalTypeQ, N_->dims(0)));
+        mod_->uniqueTypeWithNewShape(internalTypeQ, N_->dims(0)));
 
     /// Initial.
     auto *initial_bias = createRandomizedConstant(mod_, internalBiasType,
@@ -306,7 +320,7 @@ protected:
     // Output is size {MB, intermediatDim}
     Node *initial_layer = F_->createRowwiseQuantizedFullyConnected(
         "dense", start, initial_weight, initial_bias,
-        mod_.uniqueTypeWithNewShape(internalTypeQ, {minibatchSize, int_dim}),
+        mod_->uniqueTypeWithNewShape(internalTypeQ, {minibatchSize, int_dim}),
         quantization::Asymmetric,
         /* transposeWeight */ true);
 
@@ -323,7 +337,7 @@ protected:
 
       Node *intermediate_layer = F_->createRowwiseQuantizedFullyConnected(
           "dense", last, intermediate_weight, intermediate_bias,
-          mod_.uniqueType(ElemKind::Int8QTy, {minibatchSize, int_dim}, 1.0, 0),
+          mod_->uniqueType(ElemKind::Int8QTy, {minibatchSize, int_dim}, 1.0, 0),
           quantization::Asymmetric,
           /* transposeWeight */ true); // Output is size {MB, int_dim}
       last = F_->createRELU("intermediate_relu", intermediate_layer);
@@ -339,7 +353,8 @@ protected:
     Node *end_layer;
     end_layer = F_->createRowwiseQuantizedFullyConnected(
         "dense", last, end_weight, end_bias,
-        mod_.uniqueTypeWithNewShape(internalTypeQ, {minibatchSize, output_dim}),
+        mod_->uniqueTypeWithNewShape(internalTypeQ,
+                                     {minibatchSize, output_dim}),
         quantization::Asymmetric,
         /* transposeWeight */ true);
 
@@ -351,10 +366,10 @@ protected:
   /// Creates a number of Sparse tables (FP32 or Int8Q), the Indices lookup and
   /// the SpareLengthsSum Node tying it together.
   static void createSparseEmbeddings(
-      Module &mod_, PlaceholderBindings &bindings_, Function *F_,
+      Module *mod_, PlaceholderBindings &bindings_, Function *F_,
       llvm::ArrayRef<Placeholder *> lengths, llvm::ArrayRef<size_t> emb_sizes,
       size_t emb_dim, std::vector<NodeValue> &embeddings, bool quantizeSLWS) {
-    auto internalTypeF = mod_.uniqueType(ElemKind::FloatTy, {1});
+    auto internalTypeF = mod_->uniqueType(ElemKind::FloatTy, {1});
 
     for (unsigned int i = 0; i < lengths.size(); i++) {
       fillStableRandomIndex(
@@ -362,7 +377,7 @@ protected:
 
       size_t sum =
           sumOfElements(bindings_.get(lengths[i])->getHandle<int32_t>());
-      auto *indices = mod_.createPlaceholder(
+      auto *indices = mod_->createPlaceholder(
           ElemKind::Int64ITy, {sum}, "indices" + std::to_string(i), false);
       fillStableRandomIndex(bindings_.allocate(indices)->getHandle<int64_t>(),
                             2001, 0, emb_sizes[i]);
@@ -385,7 +400,7 @@ protected:
 
   /// Builds a simple graph, returns back input var and save node through refs.
   static void createSimpleRecSysGraph(
-      Module &mod_, PlaceholderBindings &bindings_, Function *F_,
+      Module *mod_, PlaceholderBindings &bindings_, Function *F_,
       llvm::ArrayRef<Placeholder *> lengths, Placeholder *dense_data,
       llvm::ArrayRef<size_t> emb_sizes, size_t emb_dim,
       llvm::StringRef funcName, bool quantizeSLWS, bool quantizeFC) {
@@ -448,22 +463,22 @@ protected:
   }
 
   void testRecSys(bool quantizeSLWS, bool quantizeFC, bool convertToFP16,
-                  bool checkConcat = false) {
+                  bool checkConcat = false, bool runNetwork = true) {
     // Create the tables.
     std::vector<Placeholder *> sparseLengths(numberOfSparseTables);
     for (unsigned int i = 0; i < sparseLengths.size(); i++) {
-      sparseLengths[i] = mod_.createPlaceholder(
+      sparseLengths[i] = module_->createPlaceholder(
           ElemKind::Int32ITy, {miniBatch}, "SL" + std::to_string(i), false);
     }
 
-    auto *denseData = mod_.createPlaceholder(
+    auto *denseData = module_->createPlaceholder(
         ElemKind::FloatTy, {miniBatch, denseDim}, "denseData",
         false); // Dense dim can be anything
 
     // Generate the network.
-    createSimpleRecSysGraph(mod_, bindings_, F_, sparseLengths, denseData,
-                            tableSizes, embeddingDim, "main", quantizeSLWS,
-                            quantizeFC);
+    createSimpleRecSysGraph(module_.get(), bindings_, F_, sparseLengths,
+                            denseData, tableSizes, embeddingDim, "main",
+                            quantizeSLWS, quantizeFC);
     SaveNode *result1 = llvm::cast<SaveNode>(F_->getNodeByName("save"));
     result = result1->getPlaceholder();
 
@@ -484,34 +499,51 @@ protected:
       precConfig.precisionModeKindSet.insert(
           Kinded::Kind::RowwiseQuantizedFullyConnectedNodeKind);
     }
+    if (runNetwork) {
+      // Init the hostManager.
+      auto backendKind = EE_.getBackend()->getBackendKind();
+      std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
 
-    // Compile.
-    EE_.compile(F_, cctx);
+      auto config = llvm::make_unique<runtime::DeviceConfig>(backendKind);
+      config->deviceSize = UINT64_MAX;
+      configs.push_back(std::move(config));
 
-    // Run graph
-    EE_.run(bindings_);
+      hostManager_.reset(new HostManager(std::move(configs)));
 
-    if (checkConcat) {
-      // Get result and verify.
-      auto *resultTensor = bindings_.get(result);
-      auto resultHandle = resultTensor->getHandle();
+      auto err = hostManager_->addNetwork(std::move(module_),
+                                          CompilationContext(), false, false);
+      EXIT_ON_ERR(std::move(err));
 
-      EXPECT_EQ(resultTensor->size(), miniBatch);
+      // // Compile.
+      // EE_.compile(F_, cctx);
 
-      auto *concatT = bindings_.get(concatPH);
-      auto concatH = concatT->getHandle();
-      // Check that intermediate concat results didn't overflow.
-      std::cout << "Intermediate concats" << std::endl;
-      concatH.dump();
-      for (int i = 0, e = concatH.size(); i < e; ++i) {
-        EXPECT_LE(fabs(concatH.raw(i)), 100);
-      }
+      // // Run graph
+      // EE_.run(bindings_);
+      err = hostManager_->runNetworkBlocking("main", bindings_);
+      EXIT_ON_ERR(std::move(err));
 
-      std::cout << "Result of prediction" << std::endl;
-      std::cout << resultHandle.size() << std::endl;
-      resultHandle.dump();
-      for (int i = 0, e = resultHandle.size(); i < e; ++i) {
-        EXPECT_GE(resultHandle.raw(i), 0.0);
+      if (checkConcat) {
+        // Get result and verify.
+        auto *resultTensor = bindings_.get(result);
+        auto resultHandle = resultTensor->getHandle();
+
+        EXPECT_EQ(resultTensor->size(), miniBatch);
+
+        auto *concatT = bindings_.get(concatPH);
+        auto concatH = concatT->getHandle();
+        // Check that intermediate concat results didn't overflow.
+        std::cout << "Intermediate concats" << std::endl;
+        concatH.dump();
+        for (int i = 0, e = concatH.size(); i < e; ++i) {
+          EXPECT_LE(fabs(concatH.raw(i)), 100);
+        }
+
+        std::cout << "Result of prediction" << std::endl;
+        std::cout << resultHandle.size() << std::endl;
+        resultHandle.dump();
+        for (int i = 0, e = resultHandle.size(); i < e; ++i) {
+          EXPECT_GE(resultHandle.raw(i), 0.0);
+        }
       }
     }
   }
@@ -525,7 +557,6 @@ protected:
     for (auto *F : mod.getFunctions()) {
       name2func[F->getName()] = F;
     }
-
     std::vector<DAGNode *> exeList;
     int endPt = 0;
     int curPt = 0;
@@ -537,6 +568,7 @@ protected:
       // The root in a G is always a dummy function.
       if (curPt > 0) {
         ExecutionEngine EE{EE_.getBackend()->getBackendKind()};
+
         Function *func = name2func[dag->name];
         EE.compile(CompilationMode::Infer, func);
         updateInputPlaceholders(bindings, vars, inputs);
@@ -557,23 +589,38 @@ protected:
 
     assert(memSize > 0 && "Must set partitionerPerDeviceMemCapacity > 0.");
     assert(numDevices > 0 && "Must set partitionerNumDevices > 0.");
-    auto backendKind = EE_.getBackend()->getBackendKind();
     std::cout << numDevices << " devices of size " << memSize << "\n";
-    std::vector<DeviceInfo> devices(numDevices, {memSize, backendKind});
-    Partitioner myPartitioner(&mod_, devices);
-    EXIT_ON_ERR(myPartitioner.Partition());
+    auto module = rawModule_;
+    auto backendKind = EE_.getBackend()->getBackendKind();
+    std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
+    for (size_t i = 0; i < numDevices; i++) {
+      auto config = llvm::make_unique<runtime::DeviceConfig>(backendKind);
+      config->deviceSize = memSize;
+      configs.push_back(std::move(config));
+    }
+    hostManagerPartitioned_.reset(new HostManager(std::move(configs)));
+    std::unique_ptr<Module> tempModule;
+    tempModule.reset(rawModule_);
+    auto err = hostManagerPartitioned_->addNetwork(
+        std::move(tempModule), CompilationContext(), false, false);
+    EXIT_ON_ERR(std::move(err));
 
-    DAGListTy myList = std::move(myPartitioner.getPartitionResult());
-    std::cout << "Partitions = " << mod_.getFunctions().size() << std::endl;
-    ASSERT_LE(mod_.getFunctions().size(), numDevices);
-    ASSERT_EQ(myList.size(), 1);
-    DAG &dag = myList.front();
+    // std::vector<DeviceInfo> devices(numDevices, {memSize, backendKind});
+    // Partitioner myPartitioner(&mod_, devices);
+    // EXIT_ON_ERR(myPartitioner.Partition());
+
+    // DAGListTy myList = std::move(myPartitioner.getPartitionResult());
+    std::cout << "Partitions = " << module->getFunctions().size() << std::endl;
+    ASSERT_LE(module->getFunctions().size(), numDevices);
+    // ASSERT_EQ(myList.size(), 1);
+    // DAG &dag = myList.front();
 
     // Run the paritioned graph and compare the results.
     bindings.allocate(mod_.getPlaceholders());
     bindings.allocate(mod_.getPlaceholders());
-    executeDAG(dag.root.get(), mod_, bindings, {}, {});
-
+    // executeDAG(dag.root.get(), mod_, bindings, {}, {});
+    err = hostManagerPartitioned_->runNetworkBlocking("main", bindings);
+    EXIT_ON_ERR(std::move(err));
     Tensor *resultTensor = bindings.get(result);
     EXPECT_TRUE(referenceResult.isEqual(*resultTensor));
   }
@@ -585,8 +632,8 @@ protected:
         mod_.createPlaceholder(ElemKind::Int32ITy, {miniBatch}, "SL0", false);
 
     std::vector<NodeValue> embeddings(sparseLengths.size());
-    createSparseEmbeddings(mod_, bindings_, F_, sparseLengths, tableSizes,
-                           embeddingDim, embeddings, true);
+    createSparseEmbeddings(module_.get(), bindings_, F_, sparseLengths,
+                           tableSizes, embeddingDim, embeddings, true);
 
     auto *save = F_->createSave("save", embeddings[0]);
     bindings_.allocate(save->getPlaceholder());
@@ -670,7 +717,7 @@ TEST_P(RecommendationSystemTest, RecSys_FP32_Partitioned) {
 
   testRecSys(/* quantizeSLWS */ false,
              /* quantizeFC */ false,
-             /* convertToFP16 */ false);
+             /* convertToFP16 */ false, false, false);
 
   deviceMemCapacity *= 2; // Double memory for this test
 
@@ -683,7 +730,7 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS) {
 
   testRecSys(/* quantizeSLWS */ true,
              /* quantizeFC */ false,
-             /* convertToFP16 */ false);
+             /* convertToFP16 */ false, false, false);
 
   deviceMemCapacity *= 2; // Double memory for this test
 
@@ -696,7 +743,7 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_FC) {
 
   testRecSys(/* quantizeSLWS */ true,
              /* quantizeFC */ true,
-             /* convertToFP16 */ false);
+             /* convertToFP16 */ false, false, false);
 
   runPartitionedGraph(numDevices, deviceMemCapacity,
                       bindings_.get(result)->clone(), bindings_);
@@ -707,7 +754,7 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_FP16) {
 
   testRecSys(/* quantizeSLWS */ true,
              /* quantizeFC */ false,
-             /* convertToFP16 */ true);
+             /* convertToFP16 */ true, false, false);
 
   runPartitionedGraph(numDevices, deviceMemCapacity,
                       bindings_.get(result)->clone(), bindings_);
@@ -718,7 +765,7 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_FC_FP16) {
 
   testRecSys(/* quantizeSLWS */ true,
              /* quantizeFC */ true,
-             /* convertToFP16 */ true);
+             /* convertToFP16 */ true, false, false);
 
   runPartitionedGraph(numDevices, deviceMemCapacity,
                       bindings_.get(result)->clone(), bindings_);

@@ -412,6 +412,7 @@ add_executable(RecommendationSystemTest
 target_link_libraries(RecommendationSystemTest
                       PRIVATE
                         BackendTestUtils
+                        HostManager
                         Converter
                         Graph
                         IR

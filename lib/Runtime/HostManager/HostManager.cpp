@@ -42,7 +42,6 @@ HostManager::init(std::vector<std::unique_ptr<DeviceConfig>> configs) {
     if (!config->hasName()) {
       config->name = "config" + std::to_string(deviceCount);
     }
-
     auto backendKind = config->backendKind;
     devices_[deviceCount] = std::unique_ptr<DeviceManager>(
         DeviceManager::createDeviceManager(backendKind, std::move(config)));
@@ -61,7 +60,7 @@ HostManager::~HostManager() { llvm::toString(clearHost()); }
 
 llvm::Error HostManager::addNetwork(std::unique_ptr<Module> module,
                                     const CompilationContext &cctx,
-                                    bool saturateHost) {
+                                    bool saturateHost, bool ownedModule) {
   std::lock_guard<std::mutex> networkLock(networkLock_);
   auto functions = module->getFunctions();
   for (auto &F : functions) {
@@ -97,13 +96,16 @@ llvm::Error HostManager::addNetwork(std::unique_ptr<Module> module,
   }
 
   RETURN_IF_ERR(provisioner_->provision(nodeList, *module));
-
-  // Clear constants contents from the module then put it in a
-  // shared_ptr to be shared between all of the networks created from each
-  // function in the module.
-  module->strip();
-  auto sharedModule = std::shared_ptr<Module>(std::move(module));
-
+  std::shared_ptr<Module> sharedModule{};
+  if (ownedModule) {
+    // Clear constants contents from the module then put it in a
+    // shared_ptr to be shared between all of the networks created from each
+    // function in the module.
+    module->strip();
+    sharedModule = std::shared_ptr<Module>(std::move(module));
+  } else {
+    module.release();
+  }
   for (auto &node : nodeList) {
     auto &networkData = networks_[(node.root)->name];
     networkData.dag = std::move(node);
