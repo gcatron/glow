@@ -286,15 +286,11 @@ struct HyphenNetwork {
   unsigned inferenceErrors(ExecutionEngine &EE, llvm::StringRef name,
                            Tensor &inputs, const vector<bool> &hyphens,
                            TrainingConfig &TC) {
-    // Compilation is destructive because of target-specific lowering.
-    // Compile a clone of the inference function.
-    auto *CF = infer_->clone(name);
-    EE.compile(CompilationMode::Infer, CF);
-
     auto batchSize = TC.batchSize;
     auto numSamples = inputs.dims()[0];
     EXPECT_LE(batchSize, numSamples);
-    auto resultHandle = bindings_.get(result_->getPlaceholder())->getHandle<>();
+    auto resultHandle =
+        bindings_.get(bindings_.getPlaceholderByName("result"))->getHandle<>();
     unsigned errors = 0;
 
     for (size_t bi = 0; bi < numSamples; bi += batchSize) {
@@ -306,7 +302,7 @@ struct HyphenNetwork {
       }
       auto batchInputs = inputs.getUnowned({batchSize, 6, 27}, {bi, 0, 0});
       updateInputPlaceholders(bindings_, {input_}, {&batchInputs});
-      EE.run(bindings_);
+      EE.run(bindings_, "infer");
 
       // Check each output in the batch.
       for (size_t i = 0; i != batchSize; i++) {
@@ -322,6 +318,16 @@ struct HyphenNetwork {
   }
 };
 } // namespace
+
+// Copy values from one PlaceholderBindings to another by name. This allows for
+// training a network on one EE then using the trained weights on another.
+void copyBetweenBindings(llvm::StringRef name, PlaceholderBindings &src,
+                         PlaceholderBindings &dst) {
+  auto srcPH = src.getPlaceholderByName(name);
+  auto dstPH = dst.getPlaceholderByName(name);
+  dst.erase(dstPH);
+  dst.insert(dstPH, src.get(srcPH)->clone());
+}
 
 TEST(HyphenTest, network) {
   ExecutionEngine EE("CPU");
@@ -371,13 +377,24 @@ TEST(HyphenTest, network) {
   // Train using mini-batch SGD.
   EE.compile(CompilationMode::Train, net.train_);
   runBatch(EE, net.bindings_, 1000, sampleCounter, {net.input_, net.expected_},
-           {&inputs, &expected});
+           {&inputs, &expected}, "infer_grad");
 
   // Now test inference on the trained network.
   // Note that we have probably overfitted the data, so we expect 100% accuracy.
   EXPECT_EQ(net.inferenceErrors(EE, "cpu", inputs, hyphens, TC), 0);
 
   // See of the interpreter gets the same result.
-  EE.setBackend("Interpreter");
-  EXPECT_EQ(net.inferenceErrors(EE, "interpreter", inputs, hyphens, TC), 0);
+
+  ExecutionEngine EE2("CPU");
+  HyphenNetwork netInterpreter(EE2.getModule(), TC);
+  EE2.compile(CompilationMode::Train, netInterpreter.infer_);
+  // Copy the trained weights from the CPU run.
+  copyBetweenBindings("bias", net.bindings_, netInterpreter.bindings_);
+  copyBetweenBindings("bias1", net.bindings_, netInterpreter.bindings_);
+  copyBetweenBindings("weights", net.bindings_, netInterpreter.bindings_);
+  copyBetweenBindings("weights1", net.bindings_, netInterpreter.bindings_);
+
+  EXPECT_EQ(
+      netInterpreter.inferenceErrors(EE2, "interpreter", inputs, hyphens, TC),
+      0);
 }

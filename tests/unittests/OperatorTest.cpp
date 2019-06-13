@@ -3036,7 +3036,8 @@ TEST_P(OperatorTest, FCGradientCheck) {
 
   Function *DF = glow::differentiate(F_, TC, "d_main");
   EE_.compile(CompilationMode::Train, DF);
-  runBatch(EE_, bindings_, 3, sampleCounter, {A, B}, {&initA, &initB});
+  runBatch(EE_, bindings_, 3, sampleCounter, {A, B}, {&initA, &initB},
+           "d_main");
 
   EXPECT_NEAR(bindings_.get(X)->getHandle().raw(0), -0.21294, 1E-5);
   EXPECT_NEAR(bindings_.get(Y)->getHandle().raw(0), 0.01656, 1E-5);
@@ -3650,9 +3651,16 @@ TEST_P(OperatorTest, Squeeze) {
     for (size_t i = 0; i < 10; i++)
       EXPECT_FLOAT_EQ(results.raw(i), expectedValues[i]);
   }
+  bindings_.clear();
+  EE_.setBackend(getBackendName());
 
   // Test 2:
   {
+    auto mod = &EE_.getModule();
+    auto *inputs = mod->createPlaceholder(ElemKind::FloatTy, {1, 2, 1, 5},
+                                          "inputs", false);
+    bindings_.allocate(inputs)->getHandle() = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    F_ = mod->createFunction("main");
     std::vector<size_t> axes = {0, 2, 2};
     Node *SQZ = F_->createSqueeze("SQZ", inputs, axes);
     SaveNode *S = F_->createSave("save", SQZ);
@@ -3667,11 +3675,18 @@ TEST_P(OperatorTest, Squeeze) {
     for (size_t i = 0; i < 10; i++)
       EXPECT_FLOAT_EQ(results.raw(i), expectedValues[i]);
   }
+  bindings_.clear();
+  EE_.setBackend(getBackendName());
 
   // Test 3: 0-dimensional Tensor
   {
+    auto mod = &EE_.getModule();
+    auto *inputs = mod->createPlaceholder(ElemKind::FloatTy, {1, 2, 1, 5},
+                                          "inputs", false);
+    bindings_.allocate(inputs)->getHandle() = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    F_ = mod->createFunction("main");
     auto *emptyInput =
-        mod_.createPlaceholder(ElemKind::FloatTy, {1}, "emptyInput", false);
+        mod->createPlaceholder(ElemKind::FloatTy, {1}, "emptyInput", false);
     bindings_.allocate(emptyInput)->getHandle() = {42.0};
 
     std::vector<size_t> axes = {0};
@@ -4159,8 +4174,7 @@ TEST_P(OperatorTest, NonSquarePaddingConvolution) {
 
   ::glow::convertPlaceholdersToConstants(F_, bindings_,
                                          {input, S->getPlaceholder()});
-  EE_.compile(CompilationMode::Infer, F_);
-  EE_.run(bindings_);
+
   Tensor &result = *bindings_.get(S->getPlaceholder());
 
   // Create the reference conv operator whose input is the same as the
@@ -4180,10 +4194,11 @@ TEST_P(OperatorTest, NonSquarePaddingConvolution) {
   S = refF->createSave("save1", CN);
   bindings_.allocate(S->getPlaceholder());
 
-  ::glow::convertPlaceholdersToConstants(F_, bindings_,
+  ::glow::convertPlaceholdersToConstants(refF, bindings_,
                                          {input, input1, S->getPlaceholder()});
   EE_.compile(CompilationMode::Infer, refF);
-  EE_.run(bindings_);
+  EE_.run(bindings_, "main");
+  EE_.run(bindings_, "mainRef");
   Tensor &result1 = *bindings_.get(S->getPlaceholder());
 
   EXPECT_TRUE(result.isEqual(result1));
@@ -4228,8 +4243,7 @@ TEST_P(OperatorTest, NonCubicPaddingConv3D) {
 
   ::glow::convertPlaceholdersToConstants(F_, bindings_,
                                          {input, S->getPlaceholder()});
-  EE_.compile(CompilationMode::Infer, F_);
-  EE_.run(bindings_);
+
   Tensor &result = *bindings_.get(S->getPlaceholder());
 
   // Create the reference conv3D operator whose input is the same as the
@@ -4253,10 +4267,11 @@ TEST_P(OperatorTest, NonCubicPaddingConv3D) {
   S = refF->createSave("save1", CN);
   bindings_.allocate(S->getPlaceholder());
 
-  ::glow::convertPlaceholdersToConstants(F_, bindings_,
+  ::glow::convertPlaceholdersToConstants(refF, bindings_,
                                          {input, input1, S->getPlaceholder()});
   EE_.compile(CompilationMode::Infer, refF);
-  EE_.run(bindings_);
+  EE_.run(bindings_, "main");
+  EE_.run(bindings_, "mainRef");
   Tensor &result1 = *bindings_.get(S->getPlaceholder());
 
   EXPECT_TRUE(result.isEqual(result1));
@@ -4279,8 +4294,6 @@ TEST_P(OperatorTest, NonSquarePaddingAveragePool) {
   auto *S = F_->createSave("save", Pool);
   bindings_.allocate(S->getPlaceholder());
 
-  EE_.compile(CompilationMode::Infer, F_);
-  EE_.run(bindings_);
   Tensor &result = *bindings_.get(S->getPlaceholder());
 
   auto *input1 =
@@ -4297,7 +4310,8 @@ TEST_P(OperatorTest, NonSquarePaddingAveragePool) {
   S = refF->createSave("save1", Pool);
   bindings_.allocate(S->getPlaceholder());
   EE_.compile(CompilationMode::Infer, refF);
-  EE_.run(bindings_);
+  EE_.run(bindings_, "main");
+  EE_.run(bindings_, "mainRef");
   Tensor &result1 = *bindings_.get(S->getPlaceholder());
 
   EXPECT_TRUE(result.isEqual(result1));
@@ -4320,9 +4334,6 @@ TEST_P(OperatorTest, NonSquarePaddingMaxPool) {
   auto *S = F_->createSave("save", Pool->getResult());
   bindings_.allocate(S->getPlaceholder());
 
-  EE_.compile(CompilationMode::Infer, F_);
-  EE_.run(bindings_);
-
   Tensor &result = *bindings_.get(S->getPlaceholder());
 
   auto *input1 =
@@ -4340,7 +4351,8 @@ TEST_P(OperatorTest, NonSquarePaddingMaxPool) {
   bindings_.allocate(S->getPlaceholder());
 
   EE_.compile(CompilationMode::Infer, refF);
-  EE_.run(bindings_);
+  EE_.run(bindings_, "main");
+  EE_.run(bindings_, "mainRef");
 
   Tensor &result1 = *bindings_.get(S->getPlaceholder());
 
@@ -5208,9 +5220,12 @@ TEST_P(OperatorTest, testBatchAdd_Float16) {
   testBatchAdd<float16_t>(bindings_, mod_, F_, EE_, ElemKind::Float16Ty);
 }
 
-static void quantizedBatchAdd(ExecutionEngine &EE, Function *F,
+static void quantizedBatchAdd(ExecutionEngine &EE,
                               PlaceholderBindings &bindings, ElemKind Ty) {
+  EE.setBackend(EE.getBackend()->getBackendName());
   auto &mod = EE.getModule();
+  auto *F = mod.createFunction("main");
+  bindings.clear();
   unsigned numSlices = 10;
   auto *input = mod.createPlaceholder(ElemKind::FloatTy, {numSlices, 10, 10},
                                       "input", false);
@@ -5264,9 +5279,9 @@ static void quantizedBatchAdd(ExecutionEngine &EE, Function *F,
 TEST_P(OperatorTest, testQuantizedBatchAdd) {
   ENABLED_BACKENDS(Interpreter, CPU, OpenCL);
   // Test Int8QTy Slice.
-  quantizedBatchAdd(EE_, F_, bindings_, ElemKind::Int8QTy);
+  quantizedBatchAdd(EE_, bindings_, ElemKind::Int8QTy);
   // Test Int32QTy Slice.
-  quantizedBatchAdd(EE_, F_, bindings_, ElemKind::Int32QTy);
+  quantizedBatchAdd(EE_, bindings_, ElemKind::Int32QTy);
 }
 
 TEST_P(OperatorTest, LengthsSum) {
@@ -5417,6 +5432,7 @@ TEST_P(OperatorTest, SparseLengthsSumI8) {
 /// Test SparseLengthsWeightedSum with an N-dimension embedding table.
 void sparseLengthsWeightedSumTest(size_t ndims, ExecutionEngine &EE) {
   auto &mod_ = EE.getModule();
+  mod_.eraseFunctions();
   auto *F_ = mod_.createFunction("slws");
   PlaceholderBindings bindings_;
 

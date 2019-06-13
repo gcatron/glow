@@ -802,16 +802,25 @@ testQuantizationEnd2End(ExecutionEngine &profileEE,
                         ElemKind quantizationPrecision,
                         const KindSet &keepOriginalPrecisionForNodes = {}) {
   auto *mod = &profileEE.getModule();
+  auto *modBackend = &backendSpecificEE.getModule();
   PlaceholderBindings bindings;
+  PlaceholderBindings bindingsBackend;
 
   auto *A =
       mod->createPlaceholder(ElemKind::FloatTy, {1, 32, 32, 2}, "A", false);
   auto *B = mod->createPlaceholder(ElemKind::FloatTy, {10, 9}, "B", false);
+  auto *AB = modBackend->createPlaceholder(ElemKind::FloatTy, {1, 32, 32, 2},
+                                           "A", false);
+  auto *BB =
+      modBackend->createPlaceholder(ElemKind::FloatTy, {10, 9}, "B", false);
 
   // STEP1 - Generate the first network to record the quantization parameters.
   Function *F1 = createSimpleGraphForQuantization(mod, bindings, A, B, "main");
-  Function *F2 = F1->clone("main2");
+  // Function *F2 = F1->clone("main2");
+  Function *F2 = createSimpleGraphForQuantization(modBackend, bindingsBackend,
+                                                  AB, BB, "main");
   SaveNode *result1 = cast<SaveNode>(F1->getNodeByName("save"));
+  SaveNode *result2 = cast<SaveNode>(F2->getNodeByName("save"));
 
   LoweredInfoMap loweredMapForProf;
   CompilationContext cctxProf{&bindings, &loweredMapForProf};
@@ -819,7 +828,7 @@ testQuantizationEnd2End(ExecutionEngine &profileEE,
   profileEE.compile(F1, cctxProf);
 
   // Run graph to capture profile.
-  profileEE.run(bindings);
+  profileEE.run(bindings, "main");
 
   // STEP2 - Use the profile to quantize a network.
   LoweredInfoMap loweredMapForQuant;
@@ -835,14 +844,13 @@ testQuantizationEnd2End(ExecutionEngine &profileEE,
   precConfig.quantConfig.assertAllNodesQuantized = true;
   precConfig.precisionModeKindSet = keepOriginalPrecisionForNodes;
 
-  SaveNode *result2 = cast<SaveNode>(F2->getNodeByName("save"));
-
   backendSpecificEE.compile(F2, cctxQuant);
-  backendSpecificEE.run(bindings);
+  backendSpecificEE.run(bindingsBackend);
 
   // STEP3 - Compare the results of the original and quantized functions.
   auto result1Handle = bindings.get(result1->getPlaceholder())->getHandle();
-  auto result2Handle = bindings.get(result2->getPlaceholder())->getHandle();
+  auto result2Handle =
+      bindingsBackend.get(result2->getPlaceholder())->getHandle();
 
   EXPECT_EQ(result1Handle.size(), result2Handle.size());
 
@@ -974,10 +982,13 @@ static Function *createGRUForQuantization(Module *M,
 TEST_P(Operator, end2endGRU) {
   // STEP1 - Generate the first network to record the quantization parameters.
   auto *mod = &profileEE.getModule();
+  auto *modBackend = &backendSpecificEE.getModule();
   PlaceholderBindings bindings;
+  PlaceholderBindings bindingsBackend;
   Function *F1 = createGRUForQuantization(mod, bindings, "main");
-  Function *F2 = F1->clone("main2");
+  Function *F2 = createGRUForQuantization(modBackend, bindingsBackend, "main");
   SaveNode *result1 = cast<SaveNode>(F1->getNodeByName("save"));
+  SaveNode *result2 = cast<SaveNode>(F2->getNodeByName("save"));
 
   LoweredInfoMap loweredMapForProf;
   CompilationContext cctxProf{&bindings, &loweredMapForProf};
@@ -1005,14 +1016,14 @@ TEST_P(Operator, end2endGRU) {
   }
 
   // STEP2 - Use the profile to quantize a network.
-  SaveNode *result2 = cast<SaveNode>(F2->getNodeByName("save"));
 
   backendSpecificEE.compile(F2, cctxQuant);
-  backendSpecificEE.run(bindings);
+  backendSpecificEE.run(bindingsBackend);
 
   // STEP3 - Compare the results of the original and quantized functions.
   auto result1Handle = bindings.get(result1->getPlaceholder())->getHandle();
-  auto result2Handle = bindings.get(result2->getPlaceholder())->getHandle();
+  auto result2Handle =
+      bindingsBackend.get(result2->getPlaceholder())->getHandle();
 
   EXPECT_EQ(result1Handle.size(), result2Handle.size());
 

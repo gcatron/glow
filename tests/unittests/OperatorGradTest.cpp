@@ -55,7 +55,7 @@ protected:
 
     // Train the network just once to record the values of gradient for
     // all variables.
-    EE_.run(bindings_);
+    EE_.run(bindings_, "record");
 
     return varGrads;
   }

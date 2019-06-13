@@ -25,6 +25,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Casting.h"
 
+#include <future>
+
 using namespace glow;
 
 /// An enum to indicate what type placholder it is.
@@ -101,8 +103,9 @@ TEST(Interpreter, profileQuantizationForANetwork) {
 
 /// Test that the symbol category for a symbol is properly set.
 TEST(RuntimeBundle, BundleSymbolInfo) {
-  Module mod;
+
   ExecutionEngine EE;
+  auto &mod = EE.getModule();
   PlaceholderBindings bindings;
 
   Tensor inputs(ElemKind::FloatTy, {1, 10, 10, 3});
@@ -123,7 +126,8 @@ TEST(RuntimeBundle, BundleSymbolInfo) {
   auto *qp = F->createQuantizationProfile(bindings, "qp", input);
 
   EE.compile(CompilationMode::Infer, F);
-  auto table = EE.getCompiledFunction().getRuntimeBundle().getSymbolTable();
+  auto dag = EE.getDAG("main");
+  auto table = dag->nodes[0]->runtimeBundle->getSymbolTable();
   // Check that placeholders and constants are correctly labelled.
   EXPECT_EQ(table.find(S->getName())->second.symbolCategory,
             glow::runtime::SymbolCategory::Placeholder);
@@ -180,8 +184,7 @@ TEST(RuntimeBundle, ContiguousPlaceholder) {
   bindings.allocate(A);
   bindings.allocate(Ex);
   EE.compile(F, cctx);
-
-  auto &table = EE.getCompiledFunction().getRuntimeBundle().getSymbolTable();
+  auto &table = EE.getDAG("main")->nodes[0]->runtimeBundle->getSymbolTable();
 
   std::vector<glow::runtime::RuntimeSymbolInfo> tableContainer;
   // Only check placeholders.
@@ -278,7 +281,7 @@ TEST_P(BackendTest, simpleInference) {
 /// implement the compileIR() function for this test to work.
 TEST_P(BackendTest, debugPrint) {
   Tensor input{0.0, 1.0, 2.0, 3.0};
-  Module mod;
+  auto &mod = EE_.getModule();
   auto ctx = llvm::make_unique<ExecutionContext>();
   Function *F = mod.createFunction("main");
   auto *IV = mod.createPlaceholder(input.getElementType(), input.dims(),
@@ -295,8 +298,42 @@ TEST_P(BackendTest, debugPrint) {
   IRBuilder(IR.get()).createDebugPrintInst("print", *IR->getWeights().begin());
 
   auto function = backend->compileIR(std::move(IR));
-  EE_.insertCompiledFunction("main", std::move(function));
-  EE_.run(*ctx.get());
+
+  // Since we are compiling IR by hand we cannot go through the normal EE route.
+  // Create and initialize the device.
+  auto config =
+      llvm::make_unique<runtime::DeviceConfig>(backend->getBackendName());
+  auto device = runtime::DeviceManager::createDeviceManager(*config);
+  EXIT_ON_ERR(device->init());
+  // Load the function on the device.
+  std::string name = "main";
+  runtime::FunctionMapTy functionMap;
+  functionMap[name] = function.get();
+
+  std::promise<void> addPromise;
+  auto fut = addPromise.get_future();
+  llvm::Error addErr = llvm::Error::success();
+  device->addNetwork(&EE_.getModule(), std::move(functionMap),
+                     [&addPromise, &addErr](const Module *, llvm::Error err) {
+                       addErr = std::move(err);
+                       addPromise.set_value();
+                     });
+  fut.wait();
+  EXIT_ON_ERR(std::move(addErr));
+  // Run the function.
+  std::promise<void> runPromise;
+  fut = runPromise.get_future();
+  llvm::Error runErr = llvm::Error::success();
+  device->runFunction(name, std::move(ctx),
+                      [&runPromise, &runErr,
+                       &ctx](runtime::RunIdentifierTy, llvm::Error err,
+                             std::unique_ptr<ExecutionContext> contextPtr) {
+                        ctx = std::move(contextPtr);
+                        runErr = std::move(err);
+                        runPromise.set_value();
+                      });
+  fut.wait();
+  EXIT_ON_ERR(std::move(runErr));
 }
 
 /// Test the compile method on the backend completes without error when
@@ -398,7 +435,7 @@ TEST_P(BackendTest, compileVectorOfFunctions) {
 /// graph representation. We compile some function and then delete the function.
 /// Later we execute the code and check that things work.
 TEST_P(BackendTest, decoupleCodegenFromGraph) {
-  Module mod;
+  auto &mod = EE_.getModule();
   PlaceholderBindings bindings;
 
   Function *F = mod.createFunction("main");
@@ -409,9 +446,6 @@ TEST_P(BackendTest, decoupleCodegenFromGraph) {
   auto *save = F->createSave("save", pow);
   auto *saveTensor = bindings.allocate(save->getPlaceholder());
   EE_.compile(CompilationMode::Infer, F);
-
-  // Collect constants to fill out the RuntimeBundle.
-  EE_.getCompiledFunction().collectConstants(&mod);
 
   // Erase all of the functions to ensure that the compiled code does not
   // depend on the graph.
@@ -467,7 +501,7 @@ TEST_P(BackendTest, compileThenAddNetwork) {
   Placeholder *FC_weights =
       llvm::dyn_cast<Placeholder>(FC->getWeights().getNode());
 
-  EE_.compile(CompilationMode::Infer, F);
+  // EE_.compile(CompilationMode::Infer, F);
 
   // Recreate that graph in a different Function.
   Function *F2 = mod.createFunction("other");

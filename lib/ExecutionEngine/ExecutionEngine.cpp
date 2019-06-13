@@ -37,8 +37,11 @@ void ExecutionEngine::setBackend(llvm::StringRef backend) {
 
 /// Set the code generator to the given \p backend.
 void ExecutionEngine::setBackend(Backend *backend, bool ownsBackend) {
-  bool differentKinds = (backend_ == nullptr || backend == nullptr) ||
-                        backend->getBackendName() != backend_->getBackendName();
+  // bool differentKinds = (backend_ == nullptr || backend == nullptr) ||
+  //                       backend->getBackendName() !=
+  //                       backend_->getBackendName();
+  module_.reset(new Module);
+  rawModule_ = module_.get();
   if (ownsBackend_) {
     delete backend_;
   }
@@ -46,19 +49,28 @@ void ExecutionEngine::setBackend(Backend *backend, bool ownsBackend) {
   ownsBackend_ = ownsBackend;
   clear();
 
-  if (differentKinds) {
-    if (device_) {
-      EXIT_ON_ERR(device_->stop());
-      device_.reset();
-    }
-
-    if (backend) {
-      device_ = std::unique_ptr<runtime::DeviceManager>(
-          runtime::DeviceManager::createDeviceManager(
-              runtime::DeviceConfig(backend->getBackendName())));
-      EXIT_ON_ERR(device_->init());
-    }
+  // if (differentKinds) {
+  // if (device_) {
+  //   EXIT_ON_ERR(device_->stop());
+  //   device_.reset();
+  // }
+  if (hostManager_) {
+    EXIT_ON_ERR(hostManager_->clearHost());
+    hostManager_.reset();
   }
+
+  if (backend) {
+    // device_ = std::unique_ptr<runtime::DeviceManager>(
+    //     runtime::DeviceManager::createDeviceManager(
+    //         backend->getBackendKind()));
+    std::vector<std::unique_ptr<runtime::DeviceConfig>> configs;
+    auto config =
+        llvm::make_unique<runtime::DeviceConfig>(backend->getBackendName());
+    configs.push_back(std::move(config));
+    hostManager_ = llvm::make_unique<runtime::HostManager>(std::move(configs));
+    // EXIT_ON_ERR(device_->init());
+  }
+  // }
 }
 
 const Backend *ExecutionEngine::getBackend() const { return backend_; }
@@ -69,10 +81,13 @@ ExecutionEngine::~ExecutionEngine() {
 }
 
 void ExecutionEngine::clear() {
-  for (auto &func : compiledFunctions_) {
-    device_->evictNetwork(func.first(), [](std::string, llvm::Error err) {
-      EXIT_ON_ERR(std::move(err));
-    });
+  // for (auto &func : compiledFunctions_) {
+  //   device_->evictNetwork(func.first(), [](std::string, llvm::Error err) {
+  //     EXIT_ON_ERR(std::move(err));
+  //   });
+  // }
+  if (hostManager_) {
+    EXIT_ON_ERR(hostManager_->clearHost());
   }
   compiledFunctions_.clear();
 }
@@ -112,38 +127,38 @@ void glow::updateInputPlaceholdersByName(PlaceholderBindings &bindings,
 }
 
 void ExecutionEngine::runInternal(ExecutionContext &context,
-                                  llvm::StringRef name,
-                                  CompiledFunction &compiledFunction) {
+                                  llvm::StringRef name) {
   // Make sure that the bindings have backing tensors for all placeholders.
-  context.getPlaceholderBindings()->allocate(M_.getPlaceholders());
+  context.getPlaceholderBindings()->allocate(rawModule_->getPlaceholders());
 
   std::unique_ptr<ExecutionContext> contextPtr(&context);
   std::promise<void> runPromise;
   auto fut = runPromise.get_future();
-  std::unique_ptr<llvm::Error> runErr;
-  device_->runFunction(
+  llvm::Error runErr = llvm::Error::success();
+  hostManager_->runNetwork(
       name, std::move(contextPtr),
       [&runPromise, &runErr](runtime::RunIdentifierTy, llvm::Error err,
                              std::unique_ptr<ExecutionContext> contextPtr) {
         // Don't delete context.
         contextPtr.release();
-        runErr = llvm::make_unique<llvm::Error>(std::move(err));
+        runErr = std::move(err);
         runPromise.set_value();
       });
+  // EXIT_ON_ERR(hostManager_->runNetworkBlocking(
+  //     name, *context.getPlaceholderBindings()));
 
   fut.wait();
-  EXIT_ON_ERR(std::move(*DCHECK_NOTNULL(runErr.get())));
+  EXIT_ON_ERR(std::move(runErr));
 }
 
 void ExecutionEngine::run(ExecutionContext &context) {
   assert(compiledFunctions_.size() == 1 &&
          "Expected exactly one compiled function.");
-  runInternal(context, *compiledFunctions_.keys().begin(),
-              getCompiledFunction());
+  runInternal(context, *compiledFunctions_.begin());
 }
 
 void ExecutionEngine::run(ExecutionContext &context, llvm::StringRef name) {
-  runInternal(context, name, getCompiledFunction(name));
+  runInternal(context, name);
 }
 
 void ExecutionEngine::run(PlaceholderBindings &bindings) {
@@ -151,8 +166,7 @@ void ExecutionEngine::run(PlaceholderBindings &bindings) {
          "Expected exactly one compiled function.");
   std::unique_ptr<PlaceholderBindings> bindingsPtr(&bindings);
   ExecutionContext context(std::move(bindingsPtr));
-  runInternal(context, *compiledFunctions_.keys().begin(),
-              getCompiledFunction());
+  runInternal(context, *compiledFunctions_.begin());
   // don't delete bindings
   context.movePlaceholderBindings().release();
 }
@@ -160,48 +174,15 @@ void ExecutionEngine::run(PlaceholderBindings &bindings) {
 void ExecutionEngine::run(PlaceholderBindings &bindings, llvm::StringRef name) {
   std::unique_ptr<PlaceholderBindings> bindingsPtr(&bindings);
   ExecutionContext context(std::move(bindingsPtr));
-  runInternal(context, name, getCompiledFunction(name));
+  runInternal(context, name);
   // don't delete bindings
   context.movePlaceholderBindings().release();
-}
-
-CompiledFunction &ExecutionEngine::getCompiledFunction() {
-  assert(compiledFunctions_.size() == 1 &&
-         "Expected exactly one compiled function.");
-  return *compiledFunctions_.begin()->second;
-}
-
-CompiledFunction &ExecutionEngine::getCompiledFunction(llvm::StringRef name) {
-  auto functionIt = compiledFunctions_.find(name);
-  assert(functionIt != compiledFunctions_.end() &&
-         "Could not find a compiled function with the given name.");
-  return *functionIt->second;
-}
-
-void ExecutionEngine::insertCompiledFunction(
-    llvm::StringRef name, std::unique_ptr<CompiledFunction> func) {
-  assert(compiledFunctions_.find(name) == compiledFunctions_.end());
-
-  runtime::FunctionMapTy functionMap;
-  functionMap[name] = func.get();
-  compiledFunctions_[name] = std::move(func);
-
-  std::promise<void> addPromise;
-  auto fut = addPromise.get_future();
-  std::unique_ptr<llvm::Error> addErr;
-  device_->addNetwork(&M_, std::move(functionMap),
-                      [&addPromise, &addErr](const Module *, llvm::Error err) {
-                        addErr = llvm::make_unique<llvm::Error>(std::move(err));
-                        addPromise.set_value();
-                      });
-  fut.wait();
-  EXIT_ON_ERR(std::move(*DCHECK_NOTNULL(addErr.get())));
 }
 
 void glow::runBatch(ExecutionEngine &EE, PlaceholderBindings &bindings,
                     size_t iterations, size_t &sampleCounter,
                     llvm::ArrayRef<Placeholder *> ph,
-                    llvm::ArrayRef<Tensor *> inputs) {
+                    llvm::ArrayRef<Tensor *> inputs, llvm::StringRef name) {
   // This is the size of one batch (the number of samples in the batch).
   size_t batchSize = ph[0]->getType()->dims()[0];
 
@@ -229,7 +210,11 @@ void glow::runBatch(ExecutionEngine &EE, PlaceholderBindings &bindings,
     }
 
     // Run the network.
-    EE.run(bindings);
+    if (name == "") {
+      EE.run(bindings);
+    } else {
+      EE.run(bindings, name);
+    }
     sampleCounter += batchSize;
   }
 }
@@ -244,25 +229,28 @@ void ExecutionEngine::compile(CompilationMode mode, Function *F,
 void ExecutionEngine::compile(Function *F, CompilationContext &cctx,
                               bool clearOtherFunctions) {
   llvm::StringRef name = F->getName();
-
+  (void)name;
   if (clearOtherFunctions) {
-    clear();
+    compiledFunctions_.clear();
   }
-
   assert(!compiledFunctions_.count(name) &&
          "A function with this name has already been compiled.");
+  assert(module_.get() && "Compile has already been called.");
 
-  EXIT_ON_ERR(::glow::optimizeFunction(F, *backend_, cctx));
-  for (const Node &N : F->getNodes()) {
-    CHECK(backend_->isOpSupported(N))
-        << "Backend must support all nodes after high-level optimizations but "
-           "encountered unsupported operator: "
-        << N.getDebugDesc();
+  for (auto &function : module_->getFunctions()) {
+    compiledFunctions_.insert(function->getName());
   }
 
-  if (auto funcOrErr = backend_->compile(F, cctx.backendOpts)) {
-    insertCompiledFunction(name, std::move(*funcOrErr));
-  } else {
-    EXIT_ON_ERR(funcOrErr.takeError());
+  EXIT_ON_ERR(hostManager_->addNetwork(std::move(module_), cctx));
+}
+void ExecutionEngine::compile(CompilationMode mode) {
+  for (auto &function : module_->getFunctions()) {
+    assert(!compiledFunctions_.count(function->getName()) &&
+           "A function with this name has already been compiled.");
+    compiledFunctions_.insert(function->getName());
   }
+  assert(module_.get() && "Compile has already been called.");
+  CompilationContext cctx;
+  cctx.compMode = mode;
+  EXIT_ON_ERR(hostManager_->addNetwork(std::move(module_), cctx));
 }

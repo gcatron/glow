@@ -473,6 +473,7 @@ add_executable(TraceEventsTest
 target_link_libraries(TraceEventsTest
                       PRIVATE
                         Backend
+                        BackendTestUtils
                         Graph
                         IR
                         ExecutionEngine

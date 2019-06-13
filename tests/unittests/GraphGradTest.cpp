@@ -65,7 +65,6 @@ TEST(GraphAutoGrad, autoGrad) {
 
   Function *TF = glow::differentiate(F, TC);
   EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
 }
 
 TEST(GraphAutoGrad, checkLRNGen) {
@@ -95,7 +94,6 @@ TEST(GraphAutoGrad, checkLRNGen) {
   (void)result;
   Function *TF = glow::differentiate(F, TC);
   EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
 }
 
 TEST(GraphAutoGrad, cloneAndDiff) {
@@ -176,7 +174,6 @@ TEST(GraphAutoGrad, checkPlaceholderGradTest) {
 
   Function *TF = glow::differentiate(F, TC);
   EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
 
   // Check that the Placeholder has multiple users, because at least one write
   // node will be added.
@@ -207,7 +204,6 @@ TEST(GraphAutoGrad, checkConvertToGradTest) {
 
   Function *TF = glow::differentiate(F, TC);
   EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
 }
 
 /// Check that we can differentiate functions that use MatMulNode.
@@ -236,7 +232,6 @@ TEST(GraphAutoGrad, checkMatMulGradTest) {
 
   Function *TF = glow::differentiate(F, TC);
   EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
 }
 
 /// Check that we can differentiate functions that use BatchedReduceAddNode.
@@ -259,7 +254,6 @@ TEST(GraphAutoGrad, checkBatchedReduceAddGradTest) {
 
   Function *TF = glow::differentiate(F, TC);
   EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
 }
 
 /// Check that we can differentiate functions that use GatherNode.
@@ -286,7 +280,6 @@ TEST(GraphAutoGrad, checkGatherGrad1DIndexTest) {
 
   Function *TF = glow::differentiate(F, TC);
   EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
 }
 
 TEST(GraphAutoGrad, checkGatherGrad2DIndexTest) {
@@ -312,7 +305,6 @@ TEST(GraphAutoGrad, checkGatherGrad2DIndexTest) {
 
   Function *TF = glow::differentiate(F, TC);
   EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
 }
 
 TEST(GraphAutoGrad, checkGatherGrad3DIndexTest) {
@@ -338,5 +330,4 @@ TEST(GraphAutoGrad, checkGatherGrad3DIndexTest) {
 
   Function *TF = glow::differentiate(F, TC);
   EE.compile(CompilationMode::Train, TF);
-  EE.compile(CompilationMode::Infer, F);
 }

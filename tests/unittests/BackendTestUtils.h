@@ -76,8 +76,6 @@ class BackendTest : public BackendStatelessTest {
 public:
   BackendTest() : mod_(EE_.getModule()) { F_ = mod_.createFunction("main"); }
 
-  ~BackendTest() override { mod_.clear(); }
-
 protected:
   ExecutionEngine EE_{getBackendName()};
   Module &mod_;
@@ -297,6 +295,12 @@ void inferTinyResnet(Tensor *input, Tensor *out, std::vector<Tensor> &weights,
 void inferExtract3D(Tensor *input, Tensor *out, llvm::StringRef kind);
 
 void inferMaxSplat(Tensor *input, Tensor *out, llvm::StringRef kind);
+
+void insertCompiledFunction(llvm::StringRef name, CompiledFunction *func,
+                            runtime::DeviceManager *device, Module *mod);
+
+void runOnDevice(ExecutionContext &context, llvm::StringRef name,
+                 runtime::DeviceManager *device);
 
 } // namespace glow
 

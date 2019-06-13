@@ -29,6 +29,8 @@
 
 #include "llvm/Support/CommandLine.h"
 
+#include <future>
+
 namespace glow {
 
 llvm::cl::OptionCategory operatorTestCat("OperatorTest Category");
@@ -80,13 +82,9 @@ profileAndGetNodeQuantizationInfo(PlaceholderBindings &bindings,
   LoweredInfoMap loweredMapForProf;
   CompilationContext cctx{&bindings, &loweredMapForProf};
   cctx.precisionConfig.quantMode = QuantizationMode::Profile;
-
-  Function *profileF = origF->clone("profile");
-  EE.compile(profileF, cctx);
-
+  EE.compile(origF, cctx);
   EE.run(bindings);
-
-  return quantization::generateNodeQuantizationInfos(bindings, profileF,
+  return quantization::generateNodeQuantizationInfos(bindings, origF,
                                                      loweredMapForProf, schema);
 }
 
@@ -95,8 +93,9 @@ profileAndGetNodeQuantizationInfo(PlaceholderBindings &bindings,
 static std::pair<CompilationContext, CompilationContext>
 setupInterpAndBackendConfigs(
     Function *IF, ExecutionEngine &IEE, PlaceholderBindings &Ibindings,
-    LoweredInfoMap &ILIM, PlaceholderBindings &Bbindings, LoweredInfoMap &BLIM,
-    ElemKind interpElemKind, ElemKind backendElemKind,
+    LoweredInfoMap &ILIM, Function *PF, ExecutionEngine &PEE,
+    PlaceholderBindings &pBindings, PlaceholderBindings &Bbindings,
+    LoweredInfoMap &BLIM, ElemKind interpElemKind, ElemKind backendElemKind,
     quantization::Schema schema, bool enableRowwiseQuantization) {
   CompilationContext cctxI{&Ibindings, &ILIM};
   CompilationContext cctxB{&Bbindings, &BLIM};
@@ -107,7 +106,7 @@ setupInterpAndBackendConfigs(
       isQuantizedElemKind(backendElemKind)) {
     // If either interp or backend need to be quantized then we need to profile
     // and get quantization infos.
-    auto NQIS = profileAndGetNodeQuantizationInfo(Ibindings, IEE, IF, schema);
+    auto NQIS = profileAndGetNodeQuantizationInfo(pBindings, PEE, PF, schema);
 
     if (isQuantizedElemKind(interpElemKind)) {
       precConfigI.quantMode = QuantizationMode::Quantize;
@@ -143,7 +142,8 @@ void compareAgainstInterpreter(llvm::StringRef backendName,
                                quantization::Schema schema) {
   ExecutionEngine IEE{"Interpreter"};
   ExecutionEngine BEE{backendName};
-  PlaceholderBindings Ibindings, Bbindings;
+  ExecutionEngine PEE{"Interpreter"};
+  PlaceholderBindings iBindings, bBindings, pBindings;
 
   LOG(INFO) << "Comparing Interpreter with precision "
             << Type::getElementName(interpElemKind).str() << " against "
@@ -151,41 +151,36 @@ void compareAgainstInterpreter(llvm::StringRef backendName,
             << Type::getElementName(backendElemKind).str();
 
   // Create the same network on the interpreter and the backend being tested.
-  FunctionTensorPair IFT = createAndInitFunction(Ibindings, IEE);
-  FunctionTensorPair BFT = createAndInitFunction(Bbindings, BEE);
+  FunctionTensorPair IFT = createAndInitFunction(iBindings, IEE);
+  FunctionTensorPair BFT = createAndInitFunction(bBindings, BEE);
+  FunctionTensorPair PFT = createAndInitFunction(pBindings, PEE);
 
   // Clone the Function inside itself many times if desired.
   std::unordered_set<Tensor *> resultTensors =
-      cloneFunInsideFun(BFT, &Bbindings, count);
+      cloneFunInsideFun(BFT, &bBindings, count);
   assert(resultTensors.size() == count &&
          "Should get the same number of Tensors back as count.");
 
   Function *IF = IFT.first;
   Function *BF = BFT.first;
+  Function *PF = PFT.first;
 
   // Set up the configs for interpreter and backend. If one or both functions
   // will be quantized, then gather a profile the graph on the interpreter, and
   // then quantize the Functions as requested.
   LoweredInfoMap ILIM, BLIM;
   auto configs = setupInterpAndBackendConfigs(
-      IF, IEE, Ibindings, ILIM, Bbindings, BLIM, interpElemKind,
-      backendElemKind, schema, enableRowwiseQuantization);
+      IF, IEE, iBindings, ILIM, PF, PEE, pBindings, bBindings, BLIM,
+      interpElemKind, backendElemKind, schema, enableRowwiseQuantization);
   CompilationContext &cctxI = configs.first;
   CompilationContext &cctxB = configs.second;
 
   BEE.compile(BF, cctxB);
-  BEE.run(Bbindings);
+  BEE.run(bBindings);
 
-  // If we profiled inside of setupInterpAndBackendConfigs() (always in FloatTy)
-  // then IF's result tensor is already set to the result of the original
-  // (FloatTy) IF. So if we did not run profiling, or if we did profile but also
-  // modified IF to be non-FloatTy, then need to run again to get IF's result.
-  const bool alreadyProfiled = isQuantizedElemKind(interpElemKind) ||
-                               isQuantizedElemKind(backendElemKind);
-  if (!alreadyProfiled || interpElemKind != ElemKind::FloatTy) {
-    IEE.compile(IF, cctxI);
-    IEE.run(Ibindings);
-  }
+  // Run the inference
+  IEE.compile(IF, cctxI);
+  IEE.run(iBindings);
 
   // Compare each of our result tensors to the original.
   for (Tensor *T : resultTensors) {
@@ -267,10 +262,12 @@ void inferIntLookupTableNet(Tensor *input, Tensor *out,
   ExecutionEngine EE(kind);
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
-  auto outTy = mod.uniqueType(ElemKind::Int8QTy, {input->size()}, 3, 3);
-  auto var = createQuantizedPlaceholder(mod, bindings, input, outTy->getScale(),
-                                        outTy->getOffset(), "var");
-  auto *lookupTable = F->createIntLookupTable("lookuptable", var, table, outTy);
+  auto inTy =
+      mod.uniqueType(ElemKind::Int8QTy, {input->size()},
+                     input->getType().getScale(), input->getType().getOffset());
+  auto var = createQuantizedPlaceholder(mod, bindings, input, inTy->getScale(),
+                                        inTy->getOffset(), "var");
+  auto *lookupTable = F->createIntLookupTable("lookuptable", var, table, inTy);
   auto *result = F->createSave("ret", lookupTable);
   auto *resultTensor = bindings.allocate(result->getPlaceholder());
 
@@ -294,14 +291,16 @@ void inferConvNet(Tensor *inputs, Tensor *filter, Tensor *bias, Tensor *out,
   TypeRef OT;
   if (inputs->getType().isQuantizedType()) {
     auto &outType = out->getType();
-    inputP =
-        createQuantizedPlaceholder(mod, bindings, inputs, outType.getScale(),
-                                   outType.getOffset(), "inputP");
+    auto &inType = inputs->getType();
+    auto &filterType = filter->getType();
+    auto &biasType = bias->getType();
+    inputP = createQuantizedPlaceholder(
+        mod, bindings, inputs, inType.getScale(), inType.getOffset(), "inputP");
     filterP =
-        createQuantizedPlaceholder(mod, bindings, filter, outType.getScale(),
-                                   outType.getOffset(), "filterP");
-    biasP = createQuantizedPlaceholder(mod, bindings, bias, outType.getScale(),
-                                       outType.getOffset(), "biasP");
+        createQuantizedPlaceholder(mod, bindings, filter, filterType.getScale(),
+                                   filterType.getOffset(), "filterP");
+    biasP = createQuantizedPlaceholder(mod, bindings, bias, biasType.getScale(),
+                                       biasType.getOffset(), "biasP");
     outP = createQuantizedPlaceholder(mod, bindings, out, outType.getScale(),
                                       outType.getOffset(), "outP");
     OT = F->getParent()->uniqueType(out->getElementType(), out->dims(),
@@ -329,9 +328,13 @@ void trainConvNet(Tensor *inputs, Tensor *kernel1, Tensor *bias1,
                   Tensor *kernel2, Tensor *bias2, Tensor *selected,
                   llvm::ArrayRef<size_t> shape1, llvm::ArrayRef<size_t> shape2,
                   Tensor *out, llvm::StringRef kind) {
-  ExecutionEngine EE(kind);
+  ExecutionEngine EET(kind);
+  ExecutionEngine EEI(kind);
+  std::vector<ExecutionEngine *> engines;
+  engines.push_back(&EEI);
+  engines.push_back(&EET);
   TrainingConfig TC;
-  PlaceholderBindings bindings;
+  PlaceholderBindings bindings, inferBindings, trainingBindings;
 
   // This variable records the number of the next sample to be used for
   // training.
@@ -340,31 +343,42 @@ void trainConvNet(Tensor *inputs, Tensor *kernel1, Tensor *bias1,
   TC.learningRate = 0.03;
   TC.momentum = 0.3;
   TC.L2Decay = 0.01;
-  auto &mod = EE.getModule();
-  Function *F = mod.createFunction("main");
-  auto *var1 = createPlaceholder(mod, bindings, inputs, "var1");
-  auto *var2 = createPlaceholder(mod, bindings, selected, "var2");
-  auto *conv1 = F->createConv(bindings, "conv1", var1, 3, {5, 3}, {2, 1},
-                              {2, 1, 2, 1}, 1);
-  bindings.get(cast<Placeholder>(conv1->getFilter()))->assign(kernel1);
-  bindings.get(cast<Placeholder>(conv1->getBias()))->assign(bias1);
-  auto *reshape1 = F->createReshape("reshape1", conv1, shape1);
-  auto *conv2 = F->createConv(bindings, "conv2", reshape1, 2, 2, 2, 0, 1);
-  bindings.get(cast<Placeholder>(conv2->getFilter()))->assign(kernel2);
-  bindings.get(cast<Placeholder>(conv2->getBias()))->assign(bias2);
-  auto *reshape2 = F->createReshape("reshape2", conv2, shape2);
-  auto *softmax = F->createSoftMax("softmax", reshape2, var2);
-  auto *result = F->createSave("ret", softmax);
-  auto *resultTensor = bindings.allocate(result->getPlaceholder());
+  Function *F;
+  Placeholder *var1, *var2;
+  for (auto EE : engines) {
+    auto &mod = EE->getModule();
+    F = mod.createFunction("main");
+    var1 = createPlaceholder(mod, bindings, inputs, "var1");
+    var2 = createPlaceholder(mod, bindings, selected, "var2");
+    auto *conv1 = F->createConv(bindings, "conv1", var1, 3, {5, 3}, {2, 1},
+                                {2, 1, 2, 1}, 1);
+    bindings.get(cast<Placeholder>(conv1->getFilter()))->assign(kernel1);
+    bindings.get(cast<Placeholder>(conv1->getBias()))->assign(bias1);
+    auto *reshape1 = F->createReshape("reshape1", conv1, shape1);
+    auto *conv2 = F->createConv(bindings, "conv2", reshape1, 2, 2, 2, 0, 1);
+    bindings.get(cast<Placeholder>(conv2->getFilter()))->assign(kernel2);
+    bindings.get(cast<Placeholder>(conv2->getBias()))->assign(bias2);
+    auto *reshape2 = F->createReshape("reshape2", conv2, shape2);
+    auto *softmax = F->createSoftMax("softmax", reshape2, var2);
+    F->createSave("ret", softmax);
+  }
+  trainingBindings.allocate(EET.getModule().getPlaceholders());
+  inferBindings.allocate(EEI.getModule().getPlaceholders());
+  bindings.copyTrainedWeights(trainingBindings);
+  auto *res = inferBindings.get(EEI.getModule().getPlaceholderByName("ret"));
 
   Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
+  EET.compile(CompilationMode::Train, TF);
 
-  runBatch(EE, bindings, 8, sampleCounter, {var1, var2}, {inputs, selected});
-  EE.compile(CompilationMode::Infer, F);
-  updateInputPlaceholders(bindings, {var1, var2}, {inputs, selected});
-  EE.run(bindings);
-  out->assign(resultTensor);
+  runBatch(EET, trainingBindings, 8, sampleCounter, {var1, var2},
+           {inputs, selected}, "main_grad");
+  trainingBindings.copyTrainedWeights(inferBindings);
+  EEI.compile(CompilationMode::Infer, F);
+  var1 = inferBindings.getPlaceholderByName("var1");
+  var2 = inferBindings.getPlaceholderByName("var2");
+  updateInputPlaceholders(inferBindings, {var1, var2}, {inputs, selected});
+  EEI.run(inferBindings, "main");
+  out->assign(res);
 }
 
 void inferLocalResponseNormalizationNet(Tensor *inputs, Tensor *out,
@@ -390,8 +404,10 @@ void trainLocalResponseNormalizationNet(Tensor *inputs, Tensor *weights,
                                         llvm::ArrayRef<size_t> shape1,
                                         llvm::ArrayRef<size_t> shape2,
                                         Tensor *out, llvm::StringRef kind) {
-  PlaceholderBindings bindings;
-  ExecutionEngine EE(kind);
+  PlaceholderBindings bindings, trainingBindings;
+  ExecutionEngine EET(kind);
+  ExecutionEngine EEI(kind);
+  std::vector<ExecutionEngine *> engines{&EEI, &EET};
   TrainingConfig TC;
 
   // This variable records the number of the next sample to be used for
@@ -401,38 +417,50 @@ void trainLocalResponseNormalizationNet(Tensor *inputs, Tensor *weights,
   TC.learningRate = 0.06;
   TC.momentum = 0.1;
   TC.L2Decay = 0.01;
-  auto &mod = EE.getModule();
-  Function *F = mod.createFunction("main");
-  auto *var1 = createPlaceholder(mod, bindings, inputs, "var1");
-  auto *var2 = createPlaceholder(mod, bindings, selected, "var2");
-  auto *fc = F->createFullyConnected(bindings, "fc", var1, bias->dims()[0]);
-  bindings.get(cast<Placeholder>(fc->getWeights()))->assign(weights);
-  bindings.get(cast<Placeholder>(fc->getBias()))->assign(bias);
-  auto *reshape1 = F->createReshape("reshape1", fc, shape1);
-  auto *lrn =
-      F->createLocalResponseNormalization("lrn", reshape1, 2, 2.0, 0.5, 1.0);
-  auto *reshape2 = F->createReshape("reshape2", lrn, shape2);
-  auto *softmax = F->createSoftMax("softmax", reshape2, var2);
-  auto *result = F->createSave("ret", softmax);
-  auto *resultTensor = bindings.allocate(result->getPlaceholder());
+  Placeholder *var1, *var2;
+  for (auto EE : engines) {
+    auto &mod = EE->getModule();
+    Function *F = mod.createFunction("main");
+    var1 = createPlaceholder(mod, bindings, inputs, "var1");
+    var2 = createPlaceholder(mod, bindings, selected, "var2");
+    auto *fc = F->createFullyConnected(bindings, "fc", var1, bias->dims()[0]);
+    bindings.get(cast<Placeholder>(fc->getWeights()))->assign(weights);
+    bindings.get(cast<Placeholder>(fc->getBias()))->assign(bias);
+    auto *reshape1 = F->createReshape("reshape1", fc, shape1);
+    auto *lrn =
+        F->createLocalResponseNormalization("lrn", reshape1, 2, 2.0, 0.5, 1.0);
+    auto *reshape2 = F->createReshape("reshape2", lrn, shape2);
+    auto *softmax = F->createSoftMax("softmax", reshape2, var2);
+    auto *result = F->createSave("ret", softmax);
+    bindings.allocate(result->getPlaceholder());
+  }
+  trainingBindings.allocate(EET.getModule().getPlaceholders());
+  bindings.copyTrainedWeights(trainingBindings);
+  bindings.clear();
+  bindings.allocate(EEI.getModule().getPlaceholders());
+  Function *TF = glow::differentiate(EET.getModule().getFunction("main"), TC);
+  EET.compile(CompilationMode::Train, TF);
+  runBatch(EET, trainingBindings, 8, sampleCounter, {var1, var2},
+           {inputs, selected}, "main_grad");
+  trainingBindings.copyTrainedWeights(bindings);
+  auto F = EEI.getModule().getFunction("main");
+  var1 = bindings.getPlaceholderByName("var1");
+  var2 = bindings.getPlaceholderByName("var2");
+  EEI.compile(CompilationMode::Infer, F);
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-  runBatch(EE, bindings, 8, sampleCounter, {var1, var2}, {inputs, selected});
-
-  EE.compile(CompilationMode::Infer, F);
-
-  runBatch(EE, bindings, 1, sampleCounter, {var1, var2}, {inputs, selected});
-  out->assign(resultTensor);
+  runBatch(EEI, bindings, 1, sampleCounter, {var1, var2}, {inputs, selected});
+  out->assign(bindings.get(bindings.getPlaceholderByName("ret")));
 }
 
 void trainAvgPoolNet(Tensor *inputs, Tensor *weights, Tensor *bias,
                      Tensor *selected, llvm::ArrayRef<size_t> shape1,
                      llvm::ArrayRef<size_t> shape2, Tensor *out,
                      llvm::StringRef kind) {
-  ExecutionEngine EE(kind);
+  ExecutionEngine EET(kind);
+  ExecutionEngine EEI(kind);
+  std::vector<ExecutionEngine *> engines{&EEI, &EET};
   TrainingConfig TC;
-  PlaceholderBindings bindings;
+  PlaceholderBindings bindings, trainingBindings;
 
   // This variable records the number of the next sample to be used for
   // training.
@@ -441,38 +469,53 @@ void trainAvgPoolNet(Tensor *inputs, Tensor *weights, Tensor *bias,
   TC.learningRate = 0.01;
   TC.momentum = 0.4;
   TC.L2Decay = 0.01;
-  auto &mod = EE.getModule();
-  Function *F = mod.createFunction("main");
-  auto *var1 = createPlaceholder(mod, bindings, inputs, "var1");
-  auto *var2 = createPlaceholder(mod, bindings, selected, "var2");
-  auto *fc = F->createFullyConnected(bindings, "fc", var1, bias->dims()[0]);
-  bindings.get(cast<Placeholder>(fc->getWeights()))->assign(weights);
-  bindings.get(cast<Placeholder>(fc->getBias()))->assign(bias);
-  auto *reshape1 = F->createReshape("reshape1", fc, shape1);
-  auto *pool = F->createAvgPool("pool", reshape1, 2, 2, 0);
-  auto *reshape2 = F->createReshape("reshape2", pool, shape2);
-  auto *softmax = F->createSoftMax("softmax", reshape2, var2);
-  auto *result = F->createSave("ret", softmax);
-  auto *resultTensor = bindings.allocate(result->getPlaceholder());
+  Placeholder *var1, *var2;
+  for (auto EE : engines) {
+    auto &mod = EE->getModule();
+    Function *F = mod.createFunction("main");
+    var1 = createPlaceholder(mod, bindings, inputs, "var1");
+    var2 = createPlaceholder(mod, bindings, selected, "var2");
+    auto *fc = F->createFullyConnected(bindings, "fc", var1, bias->dims()[0]);
+    bindings.get(cast<Placeholder>(fc->getWeights()))->assign(weights);
+    bindings.get(cast<Placeholder>(fc->getBias()))->assign(bias);
+    auto *reshape1 = F->createReshape("reshape1", fc, shape1);
+    auto *pool = F->createAvgPool("pool", reshape1, 2, 2, 0);
+    auto *reshape2 = F->createReshape("reshape2", pool, shape2);
+    auto *softmax = F->createSoftMax("softmax", reshape2, var2);
+    auto *result = F->createSave("ret", softmax);
+    bindings.allocate(result->getPlaceholder());
+  }
+  trainingBindings.allocate(EET.getModule().getPlaceholders());
+  bindings.copyTrainedWeights(trainingBindings);
+  bindings.clear();
+  bindings.allocate(EEI.getModule().getPlaceholders());
+  Function *TF = glow::differentiate(EET.getModule().getFunction("main"), TC);
+  EET.compile(CompilationMode::Train, TF);
 
-  Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
-
-  runBatch(EE, bindings, 10, sampleCounter, {var1, var2}, {inputs, selected});
-  EE.compile(CompilationMode::Infer, F);
+  runBatch(EET, trainingBindings, 10, sampleCounter, {var1, var2},
+           {inputs, selected}, "main_grad");
+  trainingBindings.copyTrainedWeights(bindings);
+  auto F = EEI.getModule().getFunction("main");
+  var1 = bindings.getPlaceholderByName("var1");
+  var2 = bindings.getPlaceholderByName("var2");
+  EEI.compile(CompilationMode::Infer, F);
 
   updateInputPlaceholders(bindings, {var1, var2}, {inputs, selected});
-  EE.run(bindings);
-  out->assign(resultTensor);
+  EEI.run(bindings);
+  out->assign(bindings.get(bindings.getPlaceholderByName("ret")));
 }
 
 void trainMaxPoolNet(Tensor *inputs, Tensor *weights, Tensor *bias,
                      Tensor *selected, llvm::ArrayRef<size_t> shape1,
                      llvm::ArrayRef<size_t> shape2, Tensor *out,
                      llvm::StringRef kind) {
-  ExecutionEngine EE(kind);
+  ExecutionEngine EET(kind);
+  ExecutionEngine EEI(kind);
+  std::vector<ExecutionEngine *> engines;
+  engines.push_back(&EEI);
+  engines.push_back(&EET);
   TrainingConfig TC;
-  PlaceholderBindings bindings;
+  PlaceholderBindings bindings, inferBindings, trainingBindings;
 
   // This variable records the number of the next sample to be used for
   // training.
@@ -481,28 +524,39 @@ void trainMaxPoolNet(Tensor *inputs, Tensor *weights, Tensor *bias,
   TC.learningRate = 0.03;
   TC.momentum = 0.3;
   TC.L2Decay = 0.003;
-  auto &mod = EE.getModule();
-  Function *F = mod.createFunction("main");
-  auto *var1 = createPlaceholder(mod, bindings, inputs, "var1");
-  auto *var2 = createPlaceholder(mod, bindings, selected, "var2");
-  auto *fc = F->createFullyConnected(bindings, "fc", var1, bias->dims()[0]);
-  bindings.get(cast<Placeholder>(fc->getWeights()))->assign(weights);
-  bindings.get(cast<Placeholder>(fc->getBias()))->assign(bias);
-  auto *reshape1 = F->createReshape("reshape1", fc, shape1);
-  auto *pool = F->createMaxPool("pool", reshape1, 5, 3, 4);
-  auto *reshape2 = F->createReshape("reshape2", pool->getResult(), shape2);
-  auto *softmax = F->createSoftMax("softmax", reshape2, var2);
-  auto *result = F->createSave("ret", softmax);
-  auto *resultTensor = bindings.allocate(result->getPlaceholder());
-
+  Function *F;
+  Placeholder *var1, *var2;
+  for (auto EE : engines) {
+    bindings.clear();
+    auto &mod = EE->getModule();
+    F = mod.createFunction("main");
+    var1 = createPlaceholder(mod, bindings, inputs, "var1");
+    var2 = createPlaceholder(mod, bindings, selected, "var2");
+    auto *fc = F->createFullyConnected(bindings, "fc", var1, bias->dims()[0]);
+    bindings.get(cast<Placeholder>(fc->getWeights()))->assign(weights);
+    bindings.get(cast<Placeholder>(fc->getBias()))->assign(bias);
+    auto *reshape1 = F->createReshape("reshape1", fc, shape1);
+    auto *pool = F->createMaxPool("pool", reshape1, 5, 3, 4);
+    auto *reshape2 = F->createReshape("reshape2", pool->getResult(), shape2);
+    auto *softmax = F->createSoftMax("softmax", reshape2, var2);
+    F->createSave("ret", softmax);
+  }
+  trainingBindings.allocate(EET.getModule().getPlaceholders());
+  inferBindings.allocate(EEI.getModule().getPlaceholders());
+  bindings.copyTrainedWeights(trainingBindings);
+  auto *res = inferBindings.get(EEI.getModule().getPlaceholderByName("ret"));
   Function *TF = glow::differentiate(F, TC);
-  EE.compile(CompilationMode::Train, TF);
+  EET.compile(CompilationMode::Train, TF);
 
-  runBatch(EE, bindings, 7, sampleCounter, {var1, var2}, {inputs, selected});
-  EE.compile(CompilationMode::Infer, F);
-
-  runBatch(EE, bindings, 1, sampleCounter, {var1, var2}, {inputs, selected});
-  out->assign(resultTensor);
+  runBatch(EET, trainingBindings, 7, sampleCounter, {var1, var2},
+           {inputs, selected}, "main_grad");
+  trainingBindings.copyTrainedWeights(inferBindings);
+  EEI.compile(CompilationMode::Infer, F);
+  var1 = inferBindings.getPlaceholderByName("var1");
+  var2 = inferBindings.getPlaceholderByName("var2");
+  runBatch(EEI, inferBindings, 1, sampleCounter, {var1, var2},
+           {inputs, selected}, "main");
+  out->assign(res);
 }
 
 void inferSmallConv(Tensor *inputs, Tensor *out, llvm::StringRef kind) {
@@ -729,9 +783,13 @@ void inferConvDKKC8(Tensor *out, llvm::StringRef kind) {
 
 void trainSoftMaxNet(Tensor *inputs, Tensor *weights, Tensor *bias,
                      Tensor *selected, Tensor *out, llvm::StringRef kind) {
-  ExecutionEngine EE(kind);
+  ExecutionEngine EET(kind);
+  ExecutionEngine EEI(kind);
+  std::vector<ExecutionEngine *> engines;
+  engines.push_back(&EEI);
+  engines.push_back(&EET);
   TrainingConfig TC;
-  PlaceholderBindings bindings;
+  PlaceholderBindings bindings, inferBindings, trainingBindings;
 
   // This variable records the number of the next sample to be used for
   // training.
@@ -740,27 +798,36 @@ void trainSoftMaxNet(Tensor *inputs, Tensor *weights, Tensor *bias,
   TC.learningRate = 0.003;
   TC.momentum = 0.7;
   TC.L2Decay = 0.001;
-  auto &mod = EE.getModule();
-  Function *F = mod.createFunction("main");
-  auto *var1 = createPlaceholder(mod, bindings, inputs, "var1");
-  auto *var2 = createPlaceholder(mod, bindings, selected, "var2");
-  auto *fc = F->createFullyConnected(bindings, "fc", var1, bias->dims()[0]);
-  bindings.get(cast<Placeholder>(fc->getWeights()))->assign(weights);
-  bindings.get(cast<Placeholder>(fc->getBias()))->assign(bias);
-  auto *softmax = F->createSoftMax("softmax", fc, var2);
-  auto *result = F->createSave("ret", softmax);
-  auto *resultTensor = bindings.allocate(result->getPlaceholder());
-
+  Function *F;
+  Placeholder *var1, *var2;
+  for (auto EE : engines) {
+    auto &mod = EE->getModule();
+    F = mod.createFunction("main");
+    var1 = createPlaceholder(mod, bindings, inputs, "var1");
+    var2 = createPlaceholder(mod, bindings, selected, "var2");
+    auto *fc = F->createFullyConnected(bindings, "fc", var1, bias->dims()[0]);
+    bindings.get(cast<Placeholder>(fc->getWeights()))->assign(weights);
+    bindings.get(cast<Placeholder>(fc->getBias()))->assign(bias);
+    auto *softmax = F->createSoftMax("softmax", fc, var2);
+    F->createSave("ret", softmax);
+  }
+  trainingBindings.allocate(EET.getModule().getPlaceholders());
+  inferBindings.allocate(EEI.getModule().getPlaceholders());
+  bindings.copyTrainedWeights(trainingBindings);
+  auto *res = inferBindings.get(EEI.getModule().getPlaceholderByName("ret"));
   Function *TF = glow::differentiate(F, TC);
 
-  EE.compile(CompilationMode::Train, TF);
+  EET.compile(CompilationMode::Train, TF);
 
-  runBatch(EE, bindings, 30, sampleCounter, {var1, var2}, {inputs, selected});
-  EE.compile(CompilationMode::Infer, F);
-
-  updateInputPlaceholders(bindings, {var1, var2}, {inputs, selected});
-  EE.run(bindings);
-  out->assign(resultTensor);
+  runBatch(EET, trainingBindings, 30, sampleCounter, {var1, var2},
+           {inputs, selected}, "main_grad");
+  trainingBindings.copyTrainedWeights(inferBindings);
+  EEI.compile(CompilationMode::Infer, F);
+  var1 = inferBindings.getPlaceholderByName("var1");
+  var2 = inferBindings.getPlaceholderByName("var2");
+  updateInputPlaceholders(inferBindings, {var1, var2}, {inputs, selected});
+  EEI.run(inferBindings, "main");
+  out->assign(res);
 }
 
 void inferTanhConcatNet(Tensor *input1, Tensor *input2, Tensor *input3,
@@ -991,9 +1058,9 @@ void inferMaxSplat(Tensor *input, Tensor *out, llvm::StringRef kind) {
   auto &mod = EE.getModule();
   Function *F = mod.createFunction("main");
 
-  auto T = mod.uniqueType(ElemKind::Int8QTy, input->getType().dims(),
-                          2 * input->getType().getScale(),
-                          -input->getType().getOffset());
+  auto T =
+      mod.uniqueType(ElemKind::Int8QTy, input->getType().dims(),
+                     input->getType().getScale(), input->getType().getOffset());
   auto *var = createQuantizedPlaceholder(mod, bindings, input, T->getScale(),
                                          T->getOffset(), "var");
   auto *rescale = F->createRescaleQuantized("rescale", var, T);
@@ -1012,6 +1079,42 @@ void inferMaxSplat(Tensor *input, Tensor *out, llvm::StringRef kind) {
   updateInputPlaceholders(bindings, {var}, {input});
   EE.run(bindings);
   out->assign(resultTensor);
+}
+
+void insertCompiledFunction(llvm::StringRef name, CompiledFunction *func,
+                            runtime::DeviceManager *device, Module *mod) {
+  runtime::FunctionMapTy functionMap;
+  functionMap[name] = func;
+
+  std::promise<void> addPromise;
+  auto fut = addPromise.get_future();
+  llvm::Error addErr = llvm::Error::success();
+  device->addNetwork(mod, std::move(functionMap),
+                     [&addPromise, &addErr](const Module *, llvm::Error err) {
+                       addErr = std::move(err);
+                       addPromise.set_value();
+                     });
+  fut.wait();
+  EXIT_ON_ERR(std::move(addErr));
+}
+
+void runOnDevice(ExecutionContext &context, llvm::StringRef name,
+                 runtime::DeviceManager *device) {
+  std::unique_ptr<ExecutionContext> contextPtr(&context);
+  std::promise<void> runPromise;
+  auto fut = runPromise.get_future();
+  llvm::Error runErr = llvm::Error::success();
+  device->runFunction(
+      name, std::move(contextPtr),
+      [&runPromise, &runErr](runtime::RunIdentifierTy, llvm::Error err,
+                             std::unique_ptr<ExecutionContext> contextPtr) {
+        // Don't delete context.
+        contextPtr.release();
+        runErr = std::move(err);
+        runPromise.set_value();
+      });
+  fut.wait();
+  EXIT_ON_ERR(std::move(runErr));
 }
 
 } // namespace glow

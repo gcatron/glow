@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include "BackendTestUtils.h"
+
+#include "glow/Backends/DeviceManager.h"
 #include "glow/ExecutionContext/ExecutionContext.h"
 #include "glow/ExecutionEngine/ExecutionEngine.h"
 #include "glow/Graph/Graph.h"
@@ -27,6 +30,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <chrono>
+#include <future>
 #include <thread>
 
 using namespace glow;
@@ -263,13 +267,10 @@ TEST_P(TraceEventsTest, automaticInstrumentation) {
   part_four(F, context, n);
 
   context.getPlaceholderBindings()->allocate(EE_.getModule().getPlaceholders());
-  auto *backend = EE_.getBackend();
   CompilationContext cctx;
   cctx.compMode = CompilationMode::Infer;
   cctx.backendOpts.autoInstrument = true;
-  EXIT_ON_ERR(::glow::optimizeFunction(F, *backend, cctx));
-  EE_.insertCompiledFunction(
-      F->getName(), EXIT_ON_ERR(backend->compile(F, cctx.backendOpts)));
+  EE_.compile(F, cctx);
 
   updateInputPlaceholders(*context.getPlaceholderBindings(), {inputPH},
                           {&inputs});
@@ -303,13 +304,10 @@ TEST_P(TraceEventsTest, manualAndAutomatic) {
   F->createTraceEvent("second half", "E", eventData, eventId++);
 
   context.getPlaceholderBindings()->allocate(EE_.getModule().getPlaceholders());
-  auto *backend = EE_.getBackend();
   CompilationContext cctx;
   cctx.compMode = CompilationMode::Infer;
   cctx.backendOpts.autoInstrument = true;
-  EXIT_ON_ERR(::glow::optimizeFunction(F, *backend, cctx));
-  EE_.insertCompiledFunction(
-      F->getName(), EXIT_ON_ERR(backend->compile(F, cctx.backendOpts)));
+  EE_.compile(F, cctx);
 
   updateInputPlaceholders(*context.getPlaceholderBindings(), {inputPH},
                           {&inputs});
@@ -357,19 +355,26 @@ TEST_P(TraceEventsTest, twoCompiles) {
   CompilationContext cctx;
   cctx.compMode = CompilationMode::Infer;
   cctx.backendOpts.autoInstrument = true;
+  cctx.backendOpts.collectConstants = true;
   EXIT_ON_ERR(::glow::optimizeFunction(F, *backend, cctx));
 
   std::string name = F->getName();
-  EE_.insertCompiledFunction(
-      name, EXIT_ON_ERR(backend->compile(F, cctx.backendOpts)));
+  auto config =
+      llvm::make_unique<runtime::DeviceConfig>(backend->getBackendName());
+  auto device = runtime::DeviceManager::createDeviceManager(*config);
+  EXIT_ON_ERR(device->init());
+  auto func1 = EXIT_ON_ERR(backend->compile(F, cctx.backendOpts));
+
+  insertCompiledFunction(name, func1.get(), device, &EE_.getModule());
 
   std::string name2 = name + "2";
-  EE_.insertCompiledFunction(
-      name2, EXIT_ON_ERR(backend->compile(F, cctx.backendOpts)));
-
+  auto func2 = EXIT_ON_ERR(backend->compile(F, cctx.backendOpts));
+  insertCompiledFunction(name2, func2.get(), device, &EE_.getModule());
+  context.getPlaceholderBindings()->allocate(EE_.getModule().getPlaceholders());
   updateInputPlaceholders(*context.getPlaceholderBindings(), {inputPH},
                           {&inputs});
-  EE_.run(context, name);
+  // EE_.run(context, name);
+  runOnDevice(context, name, device);
   auto &traceEvents = context.getTraceContext()->getTraceEvents();
 
   ASSERT_GT(traceEvents.size(), 0);
@@ -381,7 +386,10 @@ TEST_P(TraceEventsTest, twoCompiles) {
   // same millisecond.
   std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
-  EE_.run(context2, name2);
+  // EE_.run(context2, name2);
+  updateInputPlaceholders(*context2.getPlaceholderBindings(), {inputPH},
+                          {&inputs});
+  runOnDevice(context2, name2, device);
   auto &traceEvents2 = context2.getTraceContext()->getTraceEvents();
 
   ASSERT_GT(traceEvents2.size(), 0);

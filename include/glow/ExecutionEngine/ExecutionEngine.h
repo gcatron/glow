@@ -23,6 +23,7 @@
 #include "glow/Base/Traits.h"
 #include "glow/Graph/Graph.h"
 #include "glow/Graph/PlaceholderBindings.h"
+#include "glow/Runtime/HostManager/HostManager.h"
 
 #include "llvm/ADT/ArrayRef.h"
 
@@ -37,7 +38,14 @@ namespace glow {
 /// the users of this class.
 class ExecutionEngine final {
   /// The Module that represents the high-level program.
-  Module M_;
+  // Module M_;
+
+  /// Module containing the function and supporting information.
+  std::unique_ptr<Module> module_;
+
+  /// Raw pointer to module_ this is to support module access after the module
+  /// has been added to hostManager_.
+  Module *rawModule_;
 
   /// The network execution backend.
   Backend *backend_ = nullptr;
@@ -50,13 +58,15 @@ class ExecutionEngine final {
   /// The device manager for executing compiled funtions.
   std::unique_ptr<runtime::DeviceManager> device_;
 
+  /// The HostManager for executing the compiled functions.
+  std::unique_ptr<runtime::HostManager> hostManager_;
+
   /// Glow functions compiled for this ExecutionEngine's backend.
-  llvm::StringMap<std::unique_ptr<CompiledFunction>> compiledFunctions_;
+  std::set<std::string> compiledFunctions_;
 
   /// Single execution of the given \compiledFunction with the given context
   /// \bindings.
-  void runInternal(ExecutionContext &context, llvm::StringRef name,
-                   CompiledFunction &compiledFunction);
+  void runInternal(ExecutionContext &context, llvm::StringRef name);
 
 public:
   ExecutionEngine(llvm::StringRef backend = "Interpreter");
@@ -76,22 +86,15 @@ public:
   const Backend *getBackend() const;
 
   /// \returns the internal graph.
-  Module &getModule() { return M_; }
+  Module &getModule() { return *rawModule_; }
 
-  /// Clears the DeviceManager and all CompiledFunctions.
+  /// Clears the ExecutionEngine and all CompiledFunctions.
   void clear();
 
-  /// \returns the compiled function. If more than one function
-  /// has been compiled by this ExecutionEngine then a name must be supplied
-  /// to specify which function to return.
-  CompiledFunction &getCompiledFunction();
-
-  /// \returns the compiled function with the given \p name.
-  CompiledFunction &getCompiledFunction(llvm::StringRef name);
-
-  /// Stores \p func in the CompiledFunction map, enabling it to be run.
-  void insertCompiledFunction(llvm::StringRef name,
-                              std::unique_ptr<CompiledFunction> func);
+  /// \returns the DAG for the specified \p network.
+  llvm::Expected<runtime::DAG &> getDAG(llvm::StringRef network) {
+    return hostManager_->getNetworkDAG(network);
+  }
 
   /// \returns whether a node with the provided \p NI is supported by the
   /// underlying backend.
@@ -110,6 +113,18 @@ public:
   /// A convenience function for the most common type of compile.
   void compile(CompilationMode mode, Function *F,
                bool clearOtherFunctions = true);
+
+  /// A convenience function for the to compile all functions in the Module.
+  void compile(CompilationMode mode);
+
+  /// Save a bundle for a standalone execution given \p cctx. This method takes
+  /// care of everything when preparing the bundle for saving. There is no need
+  /// to invoke the compile method before it.
+  /// Make \p networkName the function name for
+  /// the entry point of the network and prepend all generated
+  /// files with this name.
+  void save(Function *F, CompilationContext &cctx, llvm::StringRef outputDir,
+            llvm::StringRef networkName);
 
   /// Context aware single execution of a function. If more than one
   /// function has been compiled by this ExecutionEngine then a name must be
@@ -161,8 +176,8 @@ void updateInputPlaceholdersByName(PlaceholderBindings &bindings, Module *mod,
 /// (sampleCounter % batchsize).
 void runBatch(ExecutionEngine &EE, PlaceholderBindings &bindings,
               size_t iterations, size_t &sampleCounter,
-              llvm::ArrayRef<Placeholder *> ph,
-              llvm::ArrayRef<Tensor *> inputs);
+              llvm::ArrayRef<Placeholder *> ph, llvm::ArrayRef<Tensor *> inputs,
+              llvm::StringRef name = "");
 
 } // namespace glow
 
